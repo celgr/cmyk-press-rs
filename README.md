@@ -1,37 +1,38 @@
 # CMYK Press
 
-CMYK Press is a Rust native After Effects effect for CMYK-style color separation,
-fixed registration offset, circular halftone dots, paper color, and source blending.
+CMYK Press は、CMYK 印刷風の色分解、固定された版ズレ、円形の網点、紙色、および元画像とのブレンドを実現する Rust 製の After Effects ネイティブエフェクトです。
 
-This implementation is based on `PrintMisregister` and keeps its CPU renderer,
-Metal GPU path, deterministic random registration, and dot processing. The default
-state follows `docs/requirements.md`: `Default CMYK Dots`, `Composite`, halftone
-enabled, circular dots, fixed random registration off, and full quality.
+- モード: `Default CMYK Dots`
+- 合成方法: `Composite`
+- 網点処理: 有効
+- 網点形状: 円形
+- 固定ランダム版ズレ: 無効
+- 品質: フル品質
 
-## Effect
+## エフェクト情報
 
-- Display name: `CMYK Press`
-- Match name: `CMYK Press`
-- Category: `Stylize`
-- macOS output: `rust/target/release/CMYK Press.plugin`
+- 表示名: `CMYK Press`
+- Match Name: `CMYK Press`
+- カテゴリ: `Stylize`
+- macOS 版の出力先: `rust/target/release/CMYK Press.plugin`
 
-## Build
+## ビルド
 
-On macOS:
+macOS では、以下のコマンドを実行します。
 
 ```bash
 bash ./scripts/build_macos_release.sh
 ```
 
-The built plug-in is:
+ビルドされたプラグインは、以下の場所に出力されます。
 
 ```text
 rust/target/release/CMYK Press.plugin
 ```
 
-## Tests
+## テスト
 
-The minimum app-free verification is:
+After Effects を起動せずに実行できる最小限の検証方法は、以下のとおりです。
 
 ```bash
 cd rust
