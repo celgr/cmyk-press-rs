@@ -1,0 +1,68 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  macos:
+    name: macOS plugin
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        working-directory: rust
+        run: AESDK_ROOT= cargo test
+
+      - name: Build release plugin
+        run: bash ./scripts/build_macos_release.sh
+
+      - name: Upload macOS plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: CMYK-Press-macOS
+          path: rust/target/release/CMYK Press.plugin
+
+  windows:
+    name: Windows AEX
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add LLVM to PATH
+        shell: pwsh
+        run: |
+          $llvmBin = Join-Path ${env:ProgramFiles} "LLVM\bin"
+          if (Test-Path $llvmBin) {
+            Add-Content $env:GITHUB_PATH $llvmBin
+          }
+
+      - name: Test
+        working-directory: rust
+        shell: pwsh
+        run: |
+          $env:AESDK_ROOT = ""
+          cargo test
+
+      - name: Build release AEX
+        shell: pwsh
+        run: .\scripts\build_windows_release.ps1
+
+      - name: Upload Windows AEX
+        uses: actions/upload-artifact@v4
+        with:
+          name: CMYK-Press-Windows
+          path: rust/target/release/CMYK Press.aex

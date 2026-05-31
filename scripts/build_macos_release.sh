@@ -21,7 +21,7 @@ cp "$profile_dir/${binary_name}_PkgInfo" "$bundle_dir/Contents/PkgInfo"
 cp "$profile_dir/${binary_name}_Info.plist" "$bundle_dir/Contents/Info.plist"
 cp "$profile_dir/lib${binary_name}.dylib" "$bundle_dir/Contents/MacOS/${plugin_name}"
 
-/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier work.onmk.CMYKPress" "$bundle_dir/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.celgr.CMYKPress" "$bundle_dir/Contents/Info.plist"
 codesign --force --options runtime --timestamp -s - "$bundle_dir"
 
 echo "Built $bundle_dir"
