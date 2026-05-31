@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 after-effects = { git = "https://github.com/virtualritz/after-effects.git" }
 num_cpus = "1.17"
+rayon = "1.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 foreign-types = "0.5"

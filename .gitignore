@@ -1,3 +1,32 @@
+# Rust build output
 /rust/target/
+target/
 
+# Local task notes
 /tasks.md
+
+# After Effects plugin artifacts
+*.plugin/
+*.aex
+*.rsrc
+*_Info.plist
+*_PkgInfo
+
+# OS metadata
+.DS_Store
+**/.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# Editor / IDE local state
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+.cache/

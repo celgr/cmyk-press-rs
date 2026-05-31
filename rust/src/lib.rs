@@ -2,6 +2,8 @@ use after_effects as ae;
 mod render_core;
 
 #[cfg(target_os = "macos")]
+use render_core::can_use_composite_single_sample_path;
+#[cfg(target_os = "macos")]
 use render_core::RenderPlan;
 use render_core::{render_cmyk_press, EffectParams, Frame, Rgba};
 pub use render_core::{
@@ -1132,7 +1134,9 @@ mod metal_gpu {
         sin_v: f32,
         cos_v: f32,
         cell: f32,
-        _pad: [f32; 3],
+        inv_cell: f32,
+        edge_width: f32,
+        _pad: f32,
     }
 
     #[repr(C)]
@@ -1195,7 +1199,9 @@ mod metal_gpu {
                         sin_v: p.sin,
                         cos_v: p.cos,
                         cell: p.cell,
-                        _pad: [0.0; 3],
+                        inv_cell: p.inv_cell,
+                        edge_width: p.edge_width,
+                        _pad: 0.0,
                     }
                 }),
             }
@@ -1204,6 +1210,7 @@ mod metal_gpu {
 
     pub struct MetalState {
         pipeline: metal::ComputePipelineState,
+        fast_pipeline: metal::ComputePipelineState,
         // Own the command queue so render() doesn't need to call device_info again.
         // This avoids failures when AE's GPUDevice suite is unavailable at render time.
         command_queue: metal::CommandQueue,
@@ -1233,6 +1240,16 @@ mod metal_gpu {
                     eprintln!("CMYK Press: Metal pipeline error: {e}");
                     ae::Error::Generic
                 })?;
+            let fast_function = library.get_function("cmyk_press_fast", None).map_err(|e| {
+                eprintln!("CMYK Press: Metal get fast_function error: {e}");
+                ae::Error::Generic
+            })?;
+            let fast_pipeline = device
+                .new_compute_pipeline_state_with_function(&fast_function)
+                .map_err(|e| {
+                    eprintln!("CMYK Press: Metal fast pipeline error: {e}");
+                    ae::Error::Generic
+                })?;
 
             // Use AE's command queue when available; otherwise create our own.
             let command_queue = match queue_opt {
@@ -1242,6 +1259,7 @@ mod metal_gpu {
 
             Ok(Self {
                 pipeline,
+                fast_pipeline,
                 command_queue,
             })
         }
@@ -1317,7 +1335,12 @@ mod metal_gpu {
 
             let command_buffer = queue.new_command_buffer();
             let encoder = command_buffer.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(&self.pipeline);
+            let pipeline = if can_use_composite_single_sample_path(ep) {
+                &self.fast_pipeline
+            } else {
+                &self.pipeline
+            };
+            encoder.set_compute_pipeline_state(pipeline);
             encoder.set_bytes(
                 0,
                 std::mem::size_of::<MetalParams>() as u64,
@@ -1376,7 +1399,9 @@ struct PlatePlan {
     float sin_v;
     float cos_v;
     float cell;
-    float3 pad;
+    float inv_cell;
+    float edge_width;
+    float pad;
 };
 
 struct Params {
@@ -1400,11 +1425,14 @@ struct Params {
     PlatePlan plates[4];
 };
 
-static inline float4 sample_pixel(texture2d<float, access::read> src, uint2 pos) {
+constexpr sampler nearest_sampler(coord::pixel, address::clamp_to_edge, filter::nearest);
+constexpr sampler linear_sampler(coord::pixel, address::clamp_to_edge, filter::linear);
+
+static inline float4 sample_pixel(texture2d<float, access::sample> src, uint2 pos) {
     return saturate(src.read(pos));
 }
 
-static inline float4 sample_nearest(texture2d<float, access::read> src, float2 pos, uint width, uint height, int edge_mode) {
+static inline float4 sample_nearest(texture2d<float, access::sample> src, float2 pos, uint width, uint height, int edge_mode) {
     if (width == 0 || height == 0) {
         return float4(0.0);
     }
@@ -1413,10 +1441,10 @@ static inline float4 sample_nearest(texture2d<float, access::read> src, float2 p
     } else if (pos.x < 0.0 || pos.y < 0.0 || pos.x > float(width - 1) || pos.y > float(height - 1)) {
         return float4(0.0);
     }
-    return sample_pixel(src, uint2(round(pos)));
+    return saturate(src.sample(nearest_sampler, pos));
 }
 
-static inline float4 sample_bilinear(texture2d<float, access::read> src, float2 pos, uint width, uint height, int edge_mode) {
+static inline float4 sample_bilinear(texture2d<float, access::sample> src, float2 pos, uint width, uint height, int edge_mode) {
     if (width == 0 || height == 0) {
         return float4(0.0);
     }
@@ -1425,15 +1453,7 @@ static inline float4 sample_bilinear(texture2d<float, access::read> src, float2 
     } else if (pos.x < 0.0 || pos.y < 0.0 || pos.x > float(width - 1) || pos.y > float(height - 1)) {
         return float4(0.0);
     }
-    uint x0 = uint(floor(pos.x));
-    uint y0 = uint(floor(pos.y));
-    uint x1 = min(x0 + 1, width - 1);
-    uint y1 = min(y0 + 1, height - 1);
-    float tx = pos.x - float(x0);
-    float ty = pos.y - float(y0);
-    return mix(mix(sample_pixel(src, uint2(x0, y0)), sample_pixel(src, uint2(x1, y0)), tx),
-               mix(sample_pixel(src, uint2(x0, y1)), sample_pixel(src, uint2(x1, y1)), tx),
-               ty);
+    return saturate(src.sample(linear_sampler, pos));
 }
 
 static inline float3 unpremultiply_rgb(float4 px) {
@@ -1454,17 +1474,29 @@ static inline float2 halftone_rotated_position(float2 xy, constant PlatePlan& pl
     return float2(rx, ry);
 }
 
-static inline float2 dot_cell_position(float2 xy, constant PlatePlan& plan, constant Params& params) {
-    float2 rotated = halftone_rotated_position(xy, plan, params);
-    return float2(rotated.x / plan.cell - floor(rotated.x / plan.cell), rotated.y / plan.cell - floor(rotated.y / plan.cell)) - 0.5;
+static inline float2 dot_cell_position_from_rotated(float2 rotated, constant PlatePlan& plan) {
+    float2 scaled = rotated * plan.inv_cell;
+    return scaled - floor(scaled) - 0.5;
 }
 
-static inline float2 halftone_sample_position(float2 xy, constant PlatePlan& plan, constant Params& params) {
-    float2 rotated = halftone_rotated_position(xy, plan, params);
-    float2 center = floor(rotated / plan.cell) * plan.cell + plan.cell * 0.5;
+static inline float2 halftone_sample_position_from_rotated(float2 rotated, constant PlatePlan& plan, constant Params& params) {
+    float2 center = floor(rotated * plan.inv_cell) * plan.cell + plan.cell * 0.5;
     float2 unrotated = float2(center.x * plan.cos_v - center.y * plan.sin_v,
                               center.x * plan.sin_v + center.y * plan.cos_v);
     return unrotated + plan.pivot - params.halftone_offset.xy;
+}
+
+struct HalftonePoint {
+    float2 sample_pos;
+    float2 cell;
+};
+
+static inline HalftonePoint halftone_point(float2 xy, constant PlatePlan& plan, constant Params& params) {
+    float2 rotated = halftone_rotated_position(xy, plan, params);
+    HalftonePoint point;
+    point.sample_pos = halftone_sample_position_from_rotated(rotated, plan, params);
+    point.cell = dot_cell_position_from_rotated(rotated, plan);
+    return point;
 }
 
 static inline float dot_radius(float value) {
@@ -1493,6 +1525,20 @@ static inline float4 rgb_to_cmyk_controls(float3 rgb, constant Params& params) {
                   k);
 }
 
+static inline float rgb_to_cmyk_plate(float3 rgb, uint plate) {
+    rgb = saturate(rgb);
+    float k = 1.0 - max(max(rgb.r, rgb.g), rgb.b);
+    if (plate == 3) {
+        return k;
+    }
+    if (k >= 0.999) {
+        return 0.0;
+    }
+    float denom = max(1.0 - k, 0.0001);
+    float channel = plate == 0 ? rgb.r : (plate == 1 ? rgb.g : rgb.b);
+    return clamp((1.0 - channel - k) / denom, 0.0, 1.0);
+}
+
 static inline float dot_shape_distance(float2 cell, int shape) {
     if (shape == 2) { // DOT_SQUARE
         return max(abs(cell.x), abs(cell.y));
@@ -1505,14 +1551,12 @@ static inline float dot_shape_distance(float2 cell, int shape) {
     }
 }
 
-static inline float halftone_coverage(float2 xy, float value, constant PlatePlan& plan, constant Params& params) {
+static inline float halftone_coverage_from_cell(float2 cell, float value, constant PlatePlan& plan, constant Params& params) {
     value = apply_dot_gain(value, params.halftone_dot_gain);
     if (value <= 0.0) return 0.0;
-    float2 cell = dot_cell_position(xy, plan, params);
     float dist = dot_shape_distance(cell, params.halftone_shape);
     float radius = dot_radius(value);
-    float edge = dot_edge_width(plan.cell, params.halftone_softness);
-    return smooth_circle(dist, radius, edge);
+    return smooth_circle(dist, radius, plan.edge_width);
 }
 
 static inline float3 composite(float4 inks, constant Params& params) {
@@ -1558,7 +1602,7 @@ static inline float4 apply_white_transparency(float3 rgb, float alpha, constant 
     return float4(recovered_rgb, alpha * coverage);
 }
 
-kernel void cmyk_press(texture2d<float, access::read> input [[texture(0)]],
+kernel void cmyk_press(texture2d<float, access::sample> input [[texture(0)]],
                        texture2d<float, access::write> output [[texture(1)]],
                        constant Params& params [[buffer(0)]],
                        uint2 gid [[thread_position_in_grid]]) {
@@ -1572,16 +1616,17 @@ kernel void cmyk_press(texture2d<float, access::read> input [[texture(0)]],
     float alpha_max = 0.0;
     for (uint plate = 0; plate < 4; ++plate) {
         constant PlatePlan& plan = params.plates[plate];
-        float2 sample_pos = params.halftone_enabled != 0 ? halftone_sample_position(xy, plan, params) : xy + plan.shift;
+        HalftonePoint halftone;
+        if (params.halftone_enabled != 0) {
+            halftone = halftone_point(xy, plan, params);
+        }
+        float2 sample_pos = params.halftone_enabled != 0 ? halftone.sample_pos : xy + plan.shift;
         float4 sampled = params.quality == 1 ? sample_nearest(input, sample_pos, params.width, params.height, params.edge_mode)
                                              : sample_bilinear(input, sample_pos, params.width, params.height, params.edge_mode);
         alpha_max = max(alpha_max, sampled.a);
-        float4 cmyk = rgb_to_cmyk_controls(unpremultiply_rgb(sampled), params);
-        inks[plate] = clamp(cmyk[plate] * sampled.a, 0.0, 2.0);
-    }
-    if (params.halftone_enabled != 0) {
-        for (uint plate = 0; plate < 4; ++plate) {
-            inks[plate] = halftone_coverage(xy, inks[plate], params.plates[plate], params);
+        inks[plate] = clamp(rgb_to_cmyk_plate(unpremultiply_rgb(sampled), plate) * sampled.a, 0.0, 2.0);
+        if (params.halftone_enabled != 0) {
+            inks[plate] = halftone_coverage_from_cell(halftone.cell, inks[plate], plan, params);
         }
     }
     inks = clamp(inks * params.ink_amounts, 0.0, 2.0);
@@ -1609,6 +1654,22 @@ kernel void cmyk_press(texture2d<float, access::read> input [[texture(0)]],
     float4 white_unmult = apply_white_transparency(rgb, alpha, params);
     rgb = white_unmult.rgb;
     alpha = white_unmult.a;
+    output.write(float4(saturate(rgb * alpha), clamp(alpha, 0.0, 1.0)), gid);
+}
+
+kernel void cmyk_press_fast(texture2d<float, access::sample> input [[texture(0)]],
+                            texture2d<float, access::write> output [[texture(1)]],
+                            constant Params& params [[buffer(0)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= params.width || gid.y >= params.height) {
+        return;
+    }
+
+    float4 original = sample_pixel(input, gid);
+    float4 cmyk = rgb_to_cmyk_controls(unpremultiply_rgb(original), params);
+    float4 inks = clamp(cmyk * original.a * params.ink_amounts, 0.0, 2.0);
+    float3 rgb = composite(inks, params);
+    float alpha = original.a;
     output.write(float4(saturate(rgb * alpha), clamp(alpha, 0.0, 1.0)), gid);
 }
 "#;

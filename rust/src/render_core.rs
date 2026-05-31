@@ -1,6 +1,5 @@
-use std::thread;
-
 use crate::*;
+use rayon::prelude::*;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -361,18 +360,15 @@ pub(crate) fn render_cmyk_press(src: &Frame, ep: &EffectParams) -> Frame {
 
     let mut out = vec![Rgba::transparent(); w * h];
     let plan = RenderPlan::new(ep, w, h);
-    let threads = num_cpus::get().max(1).min(h).max(1);
-    let rows_per_thread = h.div_ceil(threads);
+    let rows_per_chunk = h.div_ceil(num_cpus::get().max(1).min(h).max(1)).max(1);
 
-    thread::scope(|scope| {
-        for (chunk_index, out_chunk) in out.chunks_mut(rows_per_thread * w).enumerate() {
-            let y_start = chunk_index * rows_per_thread;
+    out.par_chunks_mut(rows_per_chunk * w)
+        .enumerate()
+        .for_each(|(chunk_index, out_chunk)| {
+            let y_start = chunk_index * rows_per_chunk;
             let rows = (out_chunk.len() / w).min(h.saturating_sub(y_start));
-            scope.spawn(move || {
-                render_rows(out_chunk, src, y_start, rows, ep, &plan);
-            });
-        }
-    });
+            render_rows(out_chunk, src, y_start, rows, ep, &plan);
+        });
 
     Frame { pixels: out, w, h }
 }
@@ -393,9 +389,31 @@ fn render_rows(
         for x in 0..w {
             let xy = [x as f32, y as f32];
             let original = sample_pixel(src, x, y);
-            let printed = render_pixel(src, xy, original, ep, plan);
+            let printed = match plan.path {
+                RenderPath::CompositeSingleSample => render_composite_single_sample(original, ep),
+                RenderPath::General => render_pixel(src, xy, original, ep, plan),
+            };
             out[(y - y_start) * w + x] = printed;
         }
+    }
+}
+
+fn render_composite_single_sample(original: Rgba, ep: &EffectParams) -> Rgba {
+    let cmyk = separate_all_plates(original);
+    let inks = [
+        (cmyk[0] * ep.ink_amounts[0]).clamp(0.0, 2.0),
+        (cmyk[1] * ep.ink_amounts[1]).clamp(0.0, 2.0),
+        (cmyk[2] * ep.ink_amounts[2]).clamp(0.0, 2.0),
+        (cmyk[3] * ep.ink_amounts[3]).clamp(0.0, 2.0),
+    ];
+    let rgb = composite_cmyk(inks, ep);
+    Rgba {
+        rgb: [
+            (rgb[0] * original.a).clamp(0.0, 1.0),
+            (rgb[1] * original.a).clamp(0.0, 1.0),
+            (rgb[2] * original.a).clamp(0.0, 1.0),
+        ],
+        a: original.a,
     }
 }
 
@@ -409,25 +427,28 @@ fn render_pixel(
     let mut inks = [0.0f32; PLATE_COUNT];
     let mut alpha_max: f32 = 0.0;
     for plate in 0..PLATE_COUNT {
-        let pos = if ep.halftone_enabled {
-            halftone_sample_position(xy, &plan.plates[plate], ep)
+        let halftone = if ep.halftone_enabled {
+            Some(halftone_point(xy, &plan.plates[plate], ep))
         } else {
+            None
+        };
+        let pos = halftone.map_or(
             [
                 xy[0] + plan.plates[plate].shift[0],
                 xy[1] + plan.plates[plate].shift[1],
-            ]
-        };
+            ],
+            |halftone| halftone.sample_pos,
+        );
         let sampled = if ep.quality == QUALITY_DRAFT {
             sample_nearest(src, pos[0], pos[1], ep.edge_mode)
         } else {
             sample_bilinear(src, pos[0], pos[1], ep.edge_mode)
         };
         alpha_max = alpha_max.max(sampled.a);
-        inks[plate] = separate_plate(sampled, ep, plate);
-    }
-    if ep.halftone_enabled {
-        for plate in 0..PLATE_COUNT {
-            inks[plate] = halftone_coverage(xy, inks[plate], &plan.plates[plate], ep);
+        inks[plate] = separate_plate_direct(sampled, plate);
+        if let Some(halftone) = halftone {
+            inks[plate] =
+                halftone_coverage_from_cell(halftone.cell, inks[plate], &plan.plates[plate], ep);
         }
     }
     for plate in 0..PLATE_COUNT {
@@ -519,13 +540,27 @@ fn preview_rgb(
     }
 }
 
-fn separate_plate(sampled: Rgba, ep: &EffectParams, plate: usize) -> f32 {
+fn separate_plate_direct(sampled: Rgba, plate: usize) -> f32 {
     if sampled.a <= 0.0 {
         return 0.0;
     }
     let rgb = unpremultiply(sampled).rgb;
-    let cmyk = rgb_to_cmyk_with_controls(rgb, ep);
-    (cmyk[plate] * sampled.a).clamp(0.0, 2.0)
+    let ink = rgb_to_cmyk_plate(rgb, plate);
+    (ink * sampled.a).clamp(0.0, 2.0)
+}
+
+fn separate_all_plates(sampled: Rgba) -> [f32; PLATE_COUNT] {
+    if sampled.a <= 0.0 {
+        return [0.0; PLATE_COUNT];
+    }
+    let rgb = unpremultiply(sampled).rgb;
+    let cmyk = rgb_to_cmyk(rgb);
+    [
+        (cmyk[0] * sampled.a).clamp(0.0, 2.0),
+        (cmyk[1] * sampled.a).clamp(0.0, 2.0),
+        (cmyk[2] * sampled.a).clamp(0.0, 2.0),
+        (cmyk[3] * sampled.a).clamp(0.0, 2.0),
+    ]
 }
 
 /// Composite CMYK inks onto paper.
@@ -593,7 +628,12 @@ fn composite_cmyk_illustrator(
     ]
 }
 
+#[cfg(test)]
 fn rgb_to_cmyk_with_controls(rgb: [f32; 3], _ep: &EffectParams) -> [f32; PLATE_COUNT] {
+    rgb_to_cmyk(rgb)
+}
+
+fn rgb_to_cmyk(rgb: [f32; 3]) -> [f32; PLATE_COUNT] {
     let r = rgb[0].clamp(0.0, 1.0);
     let g = rgb[1].clamp(0.0, 1.0);
     let b = rgb[2].clamp(0.0, 1.0);
@@ -610,6 +650,27 @@ fn rgb_to_cmyk_with_controls(rgb: [f32; 3], _ep: &EffectParams) -> [f32; PLATE_C
     ]
 }
 
+fn rgb_to_cmyk_plate(rgb: [f32; 3], plate: usize) -> f32 {
+    let r = rgb[0].clamp(0.0, 1.0);
+    let g = rgb[1].clamp(0.0, 1.0);
+    let b = rgb[2].clamp(0.0, 1.0);
+    let k = 1.0 - r.max(g).max(b);
+    if plate == 3 {
+        return k;
+    }
+    if k >= 0.999 {
+        return 0.0;
+    }
+    let denom = (1.0 - k).max(0.0001);
+    let channel = match plate {
+        0 => r,
+        1 => g,
+        2 => b,
+        _ => return k,
+    };
+    ((1.0 - channel - k) / denom).clamp(0.0, 1.0)
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct PlatePlan {
     pub(crate) shift: [f32; 2],
@@ -617,11 +678,20 @@ pub(crate) struct PlatePlan {
     pub(crate) sin: f32,
     pub(crate) cos: f32,
     pub(crate) cell: f32,
+    pub(crate) inv_cell: f32,
+    pub(crate) edge_width: f32,
 }
 
 #[derive(Clone, Copy)]
 pub(crate) struct RenderPlan {
     pub(crate) plates: [PlatePlan; PLATE_COUNT],
+    path: RenderPath,
+}
+
+#[derive(Clone, Copy)]
+enum RenderPath {
+    CompositeSingleSample,
+    General,
 }
 
 impl RenderPlan {
@@ -643,10 +713,38 @@ impl RenderPlan {
                     sin,
                     cos,
                     cell,
+                    inv_cell: 1.0 / cell,
+                    edge_width: dot_edge_width(cell, ep.halftone_softness),
                 }
             }),
+            path: render_path(ep),
         }
     }
+}
+
+fn render_path(ep: &EffectParams) -> RenderPath {
+    if can_use_composite_single_sample_path(ep) {
+        RenderPath::CompositeSingleSample
+    } else {
+        RenderPath::General
+    }
+}
+
+pub(crate) fn can_use_composite_single_sample_path(ep: &EffectParams) -> bool {
+    let no_plate_offsets = ep
+        .offsets
+        .iter()
+        .all(|offset| offset[0].abs() <= f32::EPSILON && offset[1].abs() <= f32::EPSILON);
+    let no_halftone_offset =
+        ep.halftone_offset[0].abs() <= f32::EPSILON && ep.halftone_offset[1].abs() <= f32::EPSILON;
+    let no_random = !ep.random_enabled || ep.random_amount == [0.0, 0.0];
+    !ep.halftone_enabled
+        && no_plate_offsets
+        && no_halftone_offset
+        && no_random
+        && ep.view_mode == VIEW_COMPOSITE
+        && ep.blend_original <= f32::EPSILON
+        && !ep.transparent_mode
 }
 
 fn halftone_cell_size(ep: &EffectParams) -> f32 {
@@ -682,16 +780,31 @@ pub fn random_signed(seed: u32, plate_id: u32, axis_id: u32) -> f32 {
     normalized * 2.0 - 1.0
 }
 
+#[derive(Clone, Copy)]
+struct HalftonePoint {
+    sample_pos: [f32; 2],
+    cell: [f32; 2],
+}
+
+#[cfg(test)]
 fn halftone_coverage(xy: [f32; 2], value: f32, plan: &PlatePlan, ep: &EffectParams) -> f32 {
+    let point = halftone_point(xy, plan, ep);
+    halftone_coverage_from_cell(point.cell, value, plan, ep)
+}
+
+fn halftone_coverage_from_cell(
+    cell: [f32; 2],
+    value: f32,
+    plan: &PlatePlan,
+    ep: &EffectParams,
+) -> f32 {
     let value = apply_dot_gain(value, ep.halftone_dot_gain);
     if value <= 0.0 {
         return 0.0;
     }
-    let cell = dot_cell_position(xy, plan, ep);
     let dist = dot_shape_distance(cell, ep.halftone_shape);
     let radius = dot_radius(value);
-    let edge = dot_edge_width(plan.cell, ep.halftone_softness);
-    smooth_circle(dist, radius, edge)
+    smooth_circle(dist, radius, plan.edge_width)
 }
 
 fn dot_shape_distance(cell: [f32; 2], shape: i32) -> f32 {
@@ -707,19 +820,35 @@ fn apply_dot_gain(value: f32, dot_gain: f32) -> f32 {
     (value.clamp(0.0, 1.0) + dot_gain.clamp(-1.0, 1.0) * 0.25).clamp(0.0, 1.0)
 }
 
-fn dot_cell_position(xy: [f32; 2], plan: &PlatePlan, ep: &EffectParams) -> [f32; 2] {
-    let rotated = halftone_rotated_position(xy, plan, ep);
+fn dot_cell_position_from_rotated(rotated: [f32; 2], plan: &PlatePlan) -> [f32; 2] {
     [
-        (rotated[0] / plan.cell).rem_euclid(1.0) - 0.5,
-        (rotated[1] / plan.cell).rem_euclid(1.0) - 0.5,
+        (rotated[0] * plan.inv_cell).rem_euclid(1.0) - 0.5,
+        (rotated[1] * plan.inv_cell).rem_euclid(1.0) - 0.5,
     ]
 }
 
+#[cfg(test)]
 fn halftone_sample_position(xy: [f32; 2], plan: &PlatePlan, ep: &EffectParams) -> [f32; 2] {
     let rotated = halftone_rotated_position(xy, plan, ep);
+    halftone_sample_position_from_rotated(rotated, plan, ep)
+}
+
+fn halftone_point(xy: [f32; 2], plan: &PlatePlan, ep: &EffectParams) -> HalftonePoint {
+    let rotated = halftone_rotated_position(xy, plan, ep);
+    HalftonePoint {
+        sample_pos: halftone_sample_position_from_rotated(rotated, plan, ep),
+        cell: dot_cell_position_from_rotated(rotated, plan),
+    }
+}
+
+fn halftone_sample_position_from_rotated(
+    rotated: [f32; 2],
+    plan: &PlatePlan,
+    ep: &EffectParams,
+) -> [f32; 2] {
     let center = [
-        ((rotated[0] / plan.cell).floor() + 0.5) * plan.cell,
-        ((rotated[1] / plan.cell).floor() + 0.5) * plan.cell,
+        ((rotated[0] * plan.inv_cell).floor() + 0.5) * plan.cell,
+        ((rotated[1] * plan.inv_cell).floor() + 0.5) * plan.cell,
     ];
     let unrotated = [
         center[0] * plan.cos - center[1] * plan.sin,
@@ -923,6 +1052,64 @@ mod tests {
         );
         let red = rgb_to_cmyk_with_controls([1.0, 0.0, 0.0], &ep);
         assert!(red[1] > 0.99 && red[2] > 0.99);
+    }
+
+    #[test]
+    fn direct_plate_separation_matches_full_cmyk() {
+        let samples = [
+            Rgba {
+                rgb: [0.2, 0.4, 0.6],
+                a: 1.0,
+            },
+            Rgba {
+                rgb: [0.1, 0.2, 0.3],
+                a: 0.5,
+            },
+            Rgba::transparent(),
+        ];
+
+        for sample in samples {
+            let all = separate_all_plates(sample);
+            for plate in 0..PLATE_COUNT {
+                let direct = separate_plate_direct(sample, plate);
+                assert!(
+                    (direct - all[plate]).abs() < 0.0001,
+                    "plate {plate}: direct={direct} all={}",
+                    all[plate]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn composite_single_sample_fast_path_matches_general_pixel() {
+        let mut ep = test_params();
+        ep.halftone_enabled = false;
+        ep.view_mode = VIEW_COMPOSITE;
+        ep.blend_original = 0.0;
+        ep.transparent_mode = false;
+        ep.offsets = [[0.0, 0.0]; PLATE_COUNT];
+        ep.random_enabled = false;
+        ep.conversion_mode = CONVERSION_SIMPLE;
+        assert!(can_use_composite_single_sample_path(&ep));
+
+        let src = Frame {
+            w: 1,
+            h: 1,
+            pixels: vec![Rgba {
+                rgb: [0.32, 0.18, 0.08],
+                a: 0.8,
+            }],
+        };
+        let original = src.pixels[0];
+        let plan = RenderPlan::new(&ep, 1, 1);
+        let fast = render_composite_single_sample(original, &ep);
+        let general = render_pixel(&src, [0.0, 0.0], original, &ep, &plan);
+
+        assert!((fast.a - general.a).abs() < 0.0001);
+        for channel in 0..3 {
+            assert!((fast.rgb[channel] - general.rgb[channel]).abs() < 0.0001);
+        }
     }
 
     #[test]
@@ -1218,6 +1405,45 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual CPU benchmark matrix"]
+    fn benchmark_cpu_render_matrix() {
+        let cases = [
+            (
+                "1080p_default",
+                1920usize,
+                1080usize,
+                CmykPressOptions::default(),
+            ),
+            (
+                "1080p_no_halftone",
+                1920usize,
+                1080usize,
+                CmykPressOptions {
+                    halftone_enabled: false,
+                    ..CmykPressOptions::default()
+                },
+            ),
+            (
+                "4k_draft",
+                3840usize,
+                2160usize,
+                CmykPressOptions {
+                    quality: QUALITY_DRAFT as u32,
+                    ..CmykPressOptions::default()
+                },
+            ),
+        ];
+
+        for (name, width, height, options) in cases {
+            let input = vec![[0.45, 0.32, 0.21, 1.0]; width * height];
+            let start = std::time::Instant::now();
+            let out = render_rgba_f32(&input, width, height, &options);
+            eprintln!("{name}: {:?}", start.elapsed());
+            assert_eq!(out.len(), width * height);
+        }
+    }
+
+    #[test]
     fn illustrator_mode_uses_ink_colors_for_compositing() {
         let ep = CmykPressOptions {
             conversion_mode: CONVERSION_ILLUSTRATOR as u32,
@@ -1274,6 +1500,12 @@ mod tests {
         let pipeline = device
             .new_compute_pipeline_state_with_function(&function)
             .expect("Metal compute pipeline should compile");
+        let fast_function = library
+            .get_function("cmyk_press_fast", None)
+            .expect("Metal fast kernel entry point should exist");
+        let fast_pipeline = device
+            .new_compute_pipeline_state_with_function(&fast_function)
+            .expect("Metal fast compute pipeline should compile");
 
         let desc = metal::TextureDescriptor::new();
         desc.set_texture_type(metal::MTLTextureType::D2);
@@ -1284,6 +1516,7 @@ mod tests {
         desc.set_usage(metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::ShaderWrite);
         let input = device.new_texture(&desc);
         let output = device.new_texture(&desc);
+        let fast_output = device.new_texture(&desc);
 
         let input_pixels = [
             1.0f32, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 0.25, 0.5, 0.75, 1.0,
@@ -1334,6 +1567,149 @@ mod tests {
             assert!(
                 v.is_finite() && (0.0..=1.0).contains(&v),
                 "output pixel[{i}] = {v} is out of range"
+            );
+        }
+
+        let command_buffer = queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&fast_pipeline);
+        encoder.set_bytes(
+            0,
+            std::mem::size_of::<metal_gpu::MetalParams>() as u64,
+            &params as *const _ as *const std::ffi::c_void,
+        );
+        encoder.set_texture(0, Some(&input));
+        encoder.set_texture(1, Some(&fast_output));
+        encoder.dispatch_threads(metal::MTLSize::new(2, 2, 1), metal::MTLSize::new(2, 2, 1));
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        assert_eq!(
+            command_buffer.status(),
+            metal::MTLCommandBufferStatus::Completed
+        );
+
+        let mut fast_pixels = [0.0f32; 16];
+        fast_output.get_bytes(
+            fast_pixels.as_mut_ptr() as *mut std::ffi::c_void,
+            2 * 4 * std::mem::size_of::<f32>() as u64,
+            region,
+            0,
+        );
+        let input_rgba = input_pixels
+            .chunks_exact(4)
+            .map(|px| [px[0], px[1], px[2], px[3]])
+            .collect::<Vec<_>>();
+        let cpu = render_rgba_f32(&input_rgba, 2, 2, &cmyk_options);
+        for (pixel, expected) in fast_pixels.chunks_exact(4).zip(cpu.iter()) {
+            for channel in 0..4 {
+                assert!(
+                    (pixel[channel] - expected[channel]).abs() < 0.02,
+                    "fast GPU channel mismatch: got {} expected {}",
+                    pixel[channel],
+                    expected[channel]
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "manual GPU benchmark matrix"]
+    fn benchmark_metal_render_matrix() {
+        let Some(device) = metal::Device::system_default() else {
+            return;
+        };
+        let options = metal::CompileOptions::new();
+        options.set_fast_math_enabled(true);
+        let library = device
+            .new_library_with_source(metal_gpu::METAL_SHADER, &options)
+            .expect("Metal shader should compile");
+        let full_pipeline = device
+            .new_compute_pipeline_state_with_function(
+                &library
+                    .get_function("cmyk_press", None)
+                    .expect("full kernel should exist"),
+            )
+            .expect("full pipeline should compile");
+        let fast_pipeline = device
+            .new_compute_pipeline_state_with_function(
+                &library
+                    .get_function("cmyk_press_fast", None)
+                    .expect("fast kernel should exist"),
+            )
+            .expect("fast pipeline should compile");
+        let queue = device.new_command_queue();
+
+        let cases = [
+            (
+                "1080p_full_default",
+                1920usize,
+                1080usize,
+                CmykPressOptions::default(),
+            ),
+            (
+                "1080p_fast_no_halftone",
+                1920usize,
+                1080usize,
+                CmykPressOptions {
+                    halftone_enabled: false,
+                    ..CmykPressOptions::default()
+                },
+            ),
+            (
+                "4k_draft",
+                3840usize,
+                2160usize,
+                CmykPressOptions {
+                    quality: QUALITY_DRAFT as u32,
+                    ..CmykPressOptions::default()
+                },
+            ),
+        ];
+
+        for (name, width, height, options) in cases {
+            let desc = metal::TextureDescriptor::new();
+            desc.set_texture_type(metal::MTLTextureType::D2);
+            desc.set_pixel_format(metal::MTLPixelFormat::RGBA32Float);
+            desc.set_width(width as u64);
+            desc.set_height(height as u64);
+            desc.set_storage_mode(metal::MTLStorageMode::Shared);
+            desc.set_usage(
+                metal::MTLTextureUsage::ShaderRead | metal::MTLTextureUsage::ShaderWrite,
+            );
+            let input = device.new_texture(&desc);
+            let output = device.new_texture(&desc);
+            let ep = options.to_effect_params();
+            let params = metal_gpu::MetalParams::new(&ep, width, height);
+            let pipeline = if can_use_composite_single_sample_path(&ep) {
+                &fast_pipeline
+            } else {
+                &full_pipeline
+            };
+
+            let start = std::time::Instant::now();
+            let command_buffer = queue.new_command_buffer();
+            let encoder = command_buffer.new_compute_command_encoder();
+            encoder.set_compute_pipeline_state(pipeline);
+            encoder.set_bytes(
+                0,
+                std::mem::size_of::<metal_gpu::MetalParams>() as u64,
+                &params as *const _ as *const std::ffi::c_void,
+            );
+            encoder.set_texture(0, Some(&input));
+            encoder.set_texture(1, Some(&output));
+            encoder.dispatch_threads(
+                metal::MTLSize::new(width as u64, height as u64, 1),
+                metal::MTLSize::new(16, 16, 1),
+            );
+            encoder.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            eprintln!("{name}: {:?}", start.elapsed());
+            assert_eq!(
+                command_buffer.status(),
+                metal::MTLCommandBufferStatus::Completed
             );
         }
     }
