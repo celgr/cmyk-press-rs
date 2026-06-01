@@ -1,6 +1,7 @@
 # CMYK Press
 
 CMYK Pressは、印刷っぽい表現（カラーハーフトーンや版ズレ）ができるRust製のAfterEffectsプラグインです。
+
 ※開発途中のリポジトリです。
 
 ## ビルド
