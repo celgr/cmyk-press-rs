@@ -1,14 +1,16 @@
 use after_effects as ae;
 mod render_core;
+mod util;
 
 #[cfg(target_os = "macos")]
 use render_core::can_use_composite_single_sample_path;
 #[cfg(target_os = "macos")]
 use render_core::RenderPlan;
-use render_core::{render_cmyk_press, EffectParams, Frame, Rgba};
+use render_core::{render_cmyk_press, EffectParams};
 pub use render_core::{
     render_rgba_f32, render_rgba_f32_with_params, CmykPressOptions, CmykPressParams,
 };
+use util::{rgba_from_straight, straight_rgb_from_rgba, to_u8, Frame, Rgba};
 
 #[derive(Eq, PartialEq, Hash, Clone, Copy, Debug)]
 enum Params {
@@ -1270,56 +1272,8 @@ fn frame_to_layer(frame: &Frame, layer: &mut ae::Layer) {
     }
 }
 
-fn rgba_from_straight(red: f32, green: f32, blue: f32, alpha: f32) -> Rgba {
-    let a = alpha.clamp(0.0, 1.0);
-    Rgba {
-        rgb: [
-            red.clamp(0.0, 1.0) * a,
-            green.clamp(0.0, 1.0) * a,
-            blue.clamp(0.0, 1.0) * a,
-        ],
-        a,
-    }
-}
-
-fn straight_rgb_from_rgba(px: Rgba) -> [f32; 3] {
-    if px.a <= 0.0001 {
-        return [0.0, 0.0, 0.0];
-    }
-    [
-        (px.rgb[0] / px.a).clamp(0.0, 1.0),
-        (px.rgb[1] / px.a).clamp(0.0, 1.0),
-        (px.rgb[2] / px.a).clamp(0.0, 1.0),
-    ]
-}
-
-fn to_u8(v: f32) -> u8 {
-    (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
-}
-
 fn to_u16(v: f32) -> u16 {
     (v.clamp(0.0, 1.0) * ae::MAX_CHANNEL16 as f32 + 0.5) as u16
-}
-
-#[cfg(test)]
-mod ae_pixel_boundary_tests {
-    use super::*;
-
-    #[test]
-    fn ae_straight_pixels_are_premultiplied_for_internal_sampling() {
-        let px = rgba_from_straight(1.0, 0.0, 0.0, 0.25);
-        assert_eq!(px.rgb, [0.25, 0.0, 0.0]);
-        assert_eq!(px.a, 0.25);
-    }
-
-    #[test]
-    fn internal_premultiplied_pixels_are_unpremultiplied_for_ae_output() {
-        let rgb = straight_rgb_from_rgba(Rgba {
-            rgb: [0.25, 0.0, 0.0],
-            a: 0.25,
-        });
-        assert_eq!(rgb, [1.0, 0.0, 0.0]);
-    }
 }
 
 #[cfg(target_os = "macos")]

@@ -1,3 +1,9 @@
+use crate::util::{
+    mix_rgb, random_signed, rgba_from_straight, sample_bilinear, sample_nearest, smoothstep,
+    straight_rgb_from_rgba, unpremultiply, Frame, Rgba,
+};
+#[cfg(test)]
+use crate::util::{sample_pixel, to_u8};
 use crate::*;
 use rayon::prelude::*;
 
@@ -265,17 +271,7 @@ pub fn render_rgba_f32(
         pixels: input
             .iter()
             .take(width * height)
-            .map(|px| {
-                let a = px[3].clamp(0.0, 1.0);
-                Rgba {
-                    rgb: [
-                        px[0].clamp(0.0, 1.0) * a,
-                        px[1].clamp(0.0, 1.0) * a,
-                        px[2].clamp(0.0, 1.0) * a,
-                    ],
-                    a,
-                }
-            })
+            .map(|px| rgba_from_straight(px[0], px[1], px[2], px[3]))
             .collect(),
     };
     let ep = options.to_effect_params();
@@ -283,8 +279,8 @@ pub fn render_rgba_f32(
         .pixels
         .into_iter()
         .map(|px| {
-            let straight = unpremultiply(px);
-            [straight.rgb[0], straight.rgb[1], straight.rgb[2], px.a]
+            let rgb = straight_rgb_from_rgba(px);
+            [rgb[0], rgb[1], rgb[2], px.a]
         })
         .collect()
 }
@@ -362,13 +358,6 @@ fn clamp_ink_colors(ink_colors: [[f32; 3]; PLATE_COUNT]) -> [[f32; 3]; PLATE_COU
     })
 }
 
-#[derive(Clone)]
-pub(crate) struct Frame {
-    pub(crate) pixels: Vec<Rgba>,
-    pub(crate) w: usize,
-    pub(crate) h: usize,
-}
-
 pub(crate) fn render_cmyk_press(src: &Frame, ep: &EffectParams) -> Frame {
     let w = src.w;
     let h = src.h;
@@ -423,6 +412,9 @@ fn render_rows(
     plan: &RenderPlan,
 ) {
     match plan.path {
+        RenderPath::Identity => {
+            render_rows_identity(out, src, y_start, rows);
+        }
         RenderPath::CompositeSingleSample => {
             render_rows_with(out, src, y_start, rows, |x, _y, _xy, original| {
                 let _ = x;
@@ -435,9 +427,7 @@ fn render_rows(
             });
         }
         RenderPath::HalftoneCompositeNoPost => {
-            render_rows_with(out, src, y_start, rows, |_, _, xy, original| {
-                render_halftone_composite_no_post(src, xy, original, ep, plan)
-            });
+            render_rows_halftone_composite_cached(out, src, y_start, rows, ep, plan);
         }
         RenderPath::GeneralNoHalftone => {
             render_rows_with(out, src, y_start, rows, |_, _, xy, original| {
@@ -452,6 +442,14 @@ fn render_rows(
     }
 }
 
+fn render_rows_identity(out: &mut [Rgba], src: &Frame, y_start: usize, rows: usize) {
+    let w = src.w;
+    let h = src.h;
+    let y_end = (y_start + rows).min(h);
+    let len = (y_end - y_start) * w;
+    out[..len].copy_from_slice(&src.pixels[y_start * w..y_start * w + len]);
+}
+
 fn render_rows_with<F>(out: &mut [Rgba], src: &Frame, y_start: usize, rows: usize, mut render: F)
 where
     F: FnMut(usize, usize, [f32; 2], Rgba) -> Rgba,
@@ -461,10 +459,98 @@ where
     let y_end = (y_start + rows).min(h);
 
     for y in y_start..y_end {
+        let src_row = y * w;
+        let out_row = (y - y_start) * w;
         for x in 0..w {
             let xy = [x as f32, y as f32];
-            let original = sample_pixel(src, x, y);
-            out[(y - y_start) * w + x] = render(x, y, xy, original);
+            let original = src.pixels[src_row + x];
+            out[out_row + x] = render(x, y, xy, original);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PlateSampleCache {
+    pos: [f32; 2],
+    ink: f32,
+}
+
+impl PlateSampleCache {
+    fn empty() -> Self {
+        Self {
+            pos: [f32::NAN, f32::NAN],
+            ink: 0.0,
+        }
+    }
+
+    fn get_or_sample(
+        &mut self,
+        src: &Frame,
+        pos: [f32; 2],
+        plate: usize,
+        nearest: bool,
+        edge_mode: i32,
+    ) -> f32 {
+        if self.pos == pos {
+            return self.ink;
+        }
+
+        let sampled = if nearest {
+            sample_nearest(src, pos[0], pos[1], edge_mode)
+        } else {
+            sample_bilinear(src, pos[0], pos[1], edge_mode)
+        };
+        let ink = separate_plate_direct(sampled, plate);
+        self.pos = pos;
+        self.ink = ink;
+        ink
+    }
+}
+
+fn render_rows_halftone_composite_cached(
+    out: &mut [Rgba],
+    src: &Frame,
+    y_start: usize,
+    rows: usize,
+    ep: &EffectParams,
+    plan: &RenderPlan,
+) {
+    let w = src.w;
+    let h = src.h;
+    let y_end = (y_start + rows).min(h);
+    let nearest = use_nearest_sampling(ep);
+
+    for y in y_start..y_end {
+        let src_row = y * w;
+        let out_row = (y - y_start) * w;
+        let mut cache = [PlateSampleCache::empty(); PLATE_COUNT];
+        for x in 0..w {
+            let xy = [x as f32, y as f32];
+            let original = src.pixels[src_row + x];
+            let mut inks = [0.0f32; PLATE_COUNT];
+            for plate in 0..PLATE_COUNT {
+                let halftone = halftone_point(xy, &plan.plates[plate], ep);
+                let plate_ink = cache[plate].get_or_sample(
+                    src,
+                    halftone.sample_pos,
+                    plate,
+                    nearest,
+                    ep.edge_mode,
+                );
+                let coverage =
+                    halftone_coverage_from_cell(halftone.cell, plate_ink, &plan.plates[plate], ep);
+                inks[plate] = (coverage * ep.ink_amounts[plate]).clamp(0.0, 2.0);
+            }
+
+            let rgb = composite_cmyk(inks, ep);
+            out[out_row + x] = Rgba {
+                rgb: [
+                    (rgb[0] * original.a).clamp(0.0, 1.0),
+                    (rgb[1] * original.a).clamp(0.0, 1.0),
+                    (rgb[2] * original.a).clamp(0.0, 1.0),
+                ],
+                a: original.a,
+            };
         }
     }
 }
@@ -499,6 +585,7 @@ fn render_composite_single_sample(original: Rgba, ep: &EffectParams) -> Rgba {
     }
 }
 
+#[cfg(test)]
 fn render_halftone_composite_no_post(
     src: &Frame,
     xy: [f32; 2],
@@ -626,10 +713,7 @@ fn finish_preview_pixel(
 }
 
 fn use_nearest_sampling(ep: &EffectParams) -> bool {
-    match ep.sampling_mode {
-        SAMPLING_NEAREST => true,
-        _ => false,
-    }
+    ep.sampling_mode == SAMPLING_NEAREST
 }
 
 fn composite_preview_to_output(rgb: [f32; 3], alpha: f32, ep: &EffectParams) -> Rgba {
@@ -724,22 +808,14 @@ fn separate_plate_direct(sampled: Rgba, plate: usize) -> f32 {
     if sampled.a <= 0.0 {
         return 0.0;
     }
-    let rgb = unpremultiply(sampled).rgb;
-    rgb_to_cmyk_plate(rgb, plate).clamp(0.0, 2.0)
+    rgb_to_cmyk_plate_from_premult(sampled, plate)
 }
 
 fn separate_all_plates(sampled: Rgba) -> [f32; PLATE_COUNT] {
     if sampled.a <= 0.0 {
         return [0.0; PLATE_COUNT];
     }
-    let rgb = unpremultiply(sampled).rgb;
-    let cmyk = rgb_to_cmyk(rgb);
-    [
-        cmyk[0].clamp(0.0, 2.0),
-        cmyk[1].clamp(0.0, 2.0),
-        cmyk[2].clamp(0.0, 2.0),
-        cmyk[3].clamp(0.0, 2.0),
-    ]
+    rgb_to_cmyk_from_premult(sampled)
 }
 
 /// Composite CMYK inks onto paper.
@@ -812,6 +888,7 @@ fn rgb_to_cmyk_with_controls(rgb: [f32; 3], _ep: &EffectParams) -> [f32; PLATE_C
     rgb_to_cmyk(rgb)
 }
 
+#[cfg(test)]
 fn rgb_to_cmyk(rgb: [f32; 3]) -> [f32; PLATE_COUNT] {
     let r = rgb[0].clamp(0.0, 1.0);
     let g = rgb[1].clamp(0.0, 1.0);
@@ -829,10 +906,29 @@ fn rgb_to_cmyk(rgb: [f32; 3]) -> [f32; PLATE_COUNT] {
     ]
 }
 
-fn rgb_to_cmyk_plate(rgb: [f32; 3], plate: usize) -> f32 {
-    let r = rgb[0].clamp(0.0, 1.0);
-    let g = rgb[1].clamp(0.0, 1.0);
-    let b = rgb[2].clamp(0.0, 1.0);
+fn rgb_to_cmyk_from_premult(sampled: Rgba) -> [f32; PLATE_COUNT] {
+    let inv_alpha = 1.0 / sampled.a.max(0.0001);
+    let r = (sampled.rgb[0] * inv_alpha).clamp(0.0, 1.0);
+    let g = (sampled.rgb[1] * inv_alpha).clamp(0.0, 1.0);
+    let b = (sampled.rgb[2] * inv_alpha).clamp(0.0, 1.0);
+    let k = 1.0 - r.max(g).max(b);
+    if k >= 0.999 {
+        return [0.0, 0.0, 0.0, k];
+    }
+    let denom = (1.0 - k).max(0.0001);
+    [
+        ((1.0 - r - k) / denom).clamp(0.0, 1.0),
+        ((1.0 - g - k) / denom).clamp(0.0, 1.0),
+        ((1.0 - b - k) / denom).clamp(0.0, 1.0),
+        k,
+    ]
+}
+
+fn rgb_to_cmyk_plate_from_premult(sampled: Rgba, plate: usize) -> f32 {
+    let inv_alpha = 1.0 / sampled.a.max(0.0001);
+    let r = (sampled.rgb[0] * inv_alpha).clamp(0.0, 1.0);
+    let g = (sampled.rgb[1] * inv_alpha).clamp(0.0, 1.0);
+    let b = (sampled.rgb[2] * inv_alpha).clamp(0.0, 1.0);
     let k = 1.0 - r.max(g).max(b);
     if plate == 3 {
         return k;
@@ -869,6 +965,7 @@ pub(crate) struct RenderPlan {
 
 #[derive(Clone, Copy)]
 enum RenderPath {
+    Identity,
     CompositeSingleSample,
     GeneralSingleSample,
     HalftoneCompositeNoPost,
@@ -905,7 +1002,9 @@ impl RenderPlan {
 }
 
 fn render_path(ep: &EffectParams) -> RenderPath {
-    if can_use_composite_single_sample_path(ep) {
+    if can_use_identity_path(ep) {
+        RenderPath::Identity
+    } else if can_use_composite_single_sample_path(ep) {
         RenderPath::CompositeSingleSample
     } else if can_use_general_single_sample_path(ep) {
         RenderPath::GeneralSingleSample
@@ -916,6 +1015,14 @@ fn render_path(ep: &EffectParams) -> RenderPath {
     } else {
         RenderPath::General
     }
+}
+
+fn can_use_identity_path(ep: &EffectParams) -> bool {
+    can_use_composite_single_sample_path(ep)
+        && ep.preserve_alpha
+        && ep.conversion_mode == CONVERSION_SIMPLE
+        && ep.paper == [1.0, 1.0, 1.0]
+        && ep.ink_amounts == [1.0; PLATE_COUNT]
 }
 
 pub(crate) fn can_use_composite_single_sample_path(ep: &EffectParams) -> bool {
@@ -969,21 +1076,6 @@ fn final_plate_offset(ep: &EffectParams, plate: usize) -> [f32; 2] {
         offset[1] += random_signed(ep.random_seed, plate as u32 + 1, 1) * ep.random_amount[1];
     }
     [-offset[0], -offset[1]]
-}
-
-pub fn hash_u32(mut value: u32) -> u32 {
-    value ^= value >> 16;
-    value = value.wrapping_mul(0x7feb_352d);
-    value ^= value >> 15;
-    value = value.wrapping_mul(0x846c_a68b);
-    value ^= value >> 16;
-    value
-}
-
-pub fn random_signed(seed: u32, plate_id: u32, axis_id: u32) -> f32 {
-    let h = hash_u32(seed ^ plate_id.wrapping_mul(31) ^ axis_id);
-    let normalized = h as f32 / u32::MAX as f32;
-    normalized * 2.0 - 1.0
 }
 
 #[derive(Clone, Copy)]
@@ -1088,138 +1180,6 @@ fn dot_edge_width(cell: f32, softness: f32) -> f32 {
 
 fn smooth_circle(dist: f32, radius: f32, edge: f32) -> f32 {
     smoothstep((radius + edge - dist) / (2.0 * edge))
-}
-
-fn smoothstep(t: f32) -> f32 {
-    let t = t.clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct Rgba {
-    pub(crate) rgb: [f32; 3],
-    pub(crate) a: f32,
-}
-
-impl Rgba {
-    pub(crate) fn transparent() -> Self {
-        Self {
-            rgb: [0.0, 0.0, 0.0],
-            a: 0.0,
-        }
-    }
-}
-
-fn unpremultiply(px: Rgba) -> Rgba {
-    if px.a <= 0.0001 {
-        return Rgba::transparent();
-    }
-    Rgba {
-        rgb: [
-            (px.rgb[0] / px.a).clamp(0.0, 1.0),
-            (px.rgb[1] / px.a).clamp(0.0, 1.0),
-            (px.rgb[2] / px.a).clamp(0.0, 1.0),
-        ],
-        a: px.a,
-    }
-}
-
-fn sample_pixel(src: &Frame, x: usize, y: usize) -> Rgba {
-    if src.w == 0 || src.h == 0 {
-        return Rgba::transparent();
-    }
-    src.pixels[(y.min(src.h - 1) * src.w) + x.min(src.w - 1)]
-}
-
-fn sample_bilinear(src: &Frame, x: f32, y: f32, edge_mode: i32) -> Rgba {
-    let w = src.w;
-    let h = src.h;
-    if w == 0 || h == 0 {
-        return Rgba::transparent();
-    }
-    let Some((x, y)) = edge_sample_position(x, y, w, h, edge_mode) else {
-        return Rgba::transparent();
-    };
-
-    let x0 = x.floor() as usize;
-    let y0 = y.floor() as usize;
-    let x1 = (x0 + 1).min(w - 1);
-    let y1 = (y0 + 1).min(h - 1);
-    let tx = x - x0 as f32;
-    let ty = y - y0 as f32;
-
-    let a = sample_pixel(src, x0, y0);
-    let b = sample_pixel(src, x1, y0);
-    let c = sample_pixel(src, x0, y1);
-    let d = sample_pixel(src, x1, y1);
-    let top = mix_rgba(a, b, tx);
-    let bottom = mix_rgba(c, d, tx);
-    mix_rgba(top, bottom, ty)
-}
-
-fn sample_nearest(src: &Frame, x: f32, y: f32, edge_mode: i32) -> Rgba {
-    let w = src.w;
-    let h = src.h;
-    if w == 0 || h == 0 {
-        return Rgba::transparent();
-    }
-    let Some((x, y)) = edge_sample_position(x, y, w, h, edge_mode) else {
-        return Rgba::transparent();
-    };
-    sample_pixel(src, x.round() as usize, y.round() as usize)
-}
-
-fn edge_sample_position(
-    x: f32,
-    y: f32,
-    width: usize,
-    height: usize,
-    edge_mode: i32,
-) -> Option<(f32, f32)> {
-    match edge_mode {
-        EDGE_CLAMP => Some((
-            x.clamp(0.0, (width - 1) as f32),
-            y.clamp(0.0, (height - 1) as f32),
-        )),
-        EDGE_MIRROR => Some((mirror_coordinate(x, width), mirror_coordinate(y, height))),
-        _ if x < 0.0 || y < 0.0 || x > (width - 1) as f32 || y > (height - 1) as f32 => None,
-        _ => Some((x, y)),
-    }
-}
-
-fn mirror_coordinate(value: f32, len: usize) -> f32 {
-    if len <= 1 {
-        return 0.0;
-    }
-    let max = (len - 1) as f32;
-    let period = max * 2.0;
-    let wrapped = value.rem_euclid(period);
-    if wrapped > max {
-        period - wrapped
-    } else {
-        wrapped
-    }
-}
-
-fn mix_rgba(a: Rgba, b: Rgba, t: f32) -> Rgba {
-    Rgba {
-        rgb: mix_rgb(a.rgb, b.rgb, t),
-        a: a.a + (b.a - a.a) * t.clamp(0.0, 1.0),
-    }
-}
-
-fn mix_rgb(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
-    let t = t.clamp(0.0, 1.0);
-    [
-        a[0] + (b[0] - a[0]) * t,
-        a[1] + (b[1] - a[1]) * t,
-        a[2] + (b[2] - a[2]) * t,
-    ]
-}
-
-#[cfg(test)]
-fn to_u8(v: f32) -> u8 {
-    (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
 }
 
 #[cfg(test)]
@@ -1350,6 +1310,91 @@ mod tests {
         assert!((fast.a - general.a).abs() < 0.0001);
         for channel in 0..3 {
             assert!((fast.rgb[channel] - general.rgb[channel]).abs() < 0.0001);
+        }
+    }
+
+    #[test]
+    fn simple_full_ink_no_halftone_uses_identity_path() {
+        let mut ep = test_params();
+        ep.halftone_enabled = false;
+        ep.view_mode = VIEW_COMPOSITE;
+        ep.blend_original = 0.0;
+        ep.offsets = [[0.0, 0.0]; PLATE_COUNT];
+        ep.random_enabled = false;
+        ep.conversion_mode = CONVERSION_SIMPLE;
+        ep.paper = [1.0, 1.0, 1.0];
+        ep.ink_amounts = [1.0; PLATE_COUNT];
+        ep.preserve_alpha = true;
+
+        assert!(matches!(render_path(&ep), RenderPath::Identity));
+
+        let src = Frame {
+            w: 2,
+            h: 1,
+            pixels: vec![
+                Rgba {
+                    rgb: [0.2, 0.1, 0.0],
+                    a: 0.5,
+                },
+                Rgba {
+                    rgb: [0.1, 0.4, 0.2],
+                    a: 1.0,
+                },
+            ],
+        };
+        let out = render_cmyk_press(&src, &ep);
+        assert_eq!(out.pixels[0].rgb, src.pixels[0].rgb);
+        assert_eq!(out.pixels[0].a, src.pixels[0].a);
+        assert_eq!(out.pixels[1].rgb, src.pixels[1].rgb);
+        assert_eq!(out.pixels[1].a, src.pixels[1].a);
+    }
+
+    #[test]
+    fn cached_halftone_composite_matches_uncached_pixel_math() {
+        let mut ep = test_params();
+        ep.halftone_enabled = true;
+        ep.view_mode = VIEW_COMPOSITE;
+        ep.blend_original = 0.0;
+        ep.preserve_alpha = true;
+        ep.transparent_mode = false;
+        assert!(matches!(
+            render_path(&ep),
+            RenderPath::HalftoneCompositeNoPost
+        ));
+
+        let src = Frame {
+            w: 5,
+            h: 3,
+            pixels: (0..15)
+                .map(|i| Rgba {
+                    rgb: [
+                        ((i * 17) % 255) as f32 / 255.0,
+                        ((i * 29) % 255) as f32 / 255.0,
+                        ((i * 41) % 255) as f32 / 255.0,
+                    ],
+                    a: 1.0,
+                })
+                .collect(),
+        };
+        let plan = RenderPlan::new(&ep, src.w, src.h);
+        let cached = render_cmyk_press(&src, &ep);
+
+        for y in 0..src.h {
+            for x in 0..src.w {
+                let original = src.pixels[y * src.w + x];
+                let uncached = render_halftone_composite_no_post(
+                    &src,
+                    [x as f32, y as f32],
+                    original,
+                    &ep,
+                    &plan,
+                );
+                let fast = cached.pixels[y * src.w + x];
+                assert!((fast.a - uncached.a).abs() < 0.0001);
+                for channel in 0..3 {
+                    assert!((fast.rgb[channel] - uncached.rgb[channel]).abs() < 0.0001);
+                }
+            }
         }
     }
 
