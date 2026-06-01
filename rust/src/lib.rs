@@ -34,7 +34,6 @@ enum Params {
     ConversionMode,
     ViewMode,
     PreserveAlpha,
-    TransparentMode,
     BlendOriginal,
     CyanAmount,
     MagentaAmount,
@@ -74,10 +73,13 @@ enum Params {
     HalftoneBlackAngle,
     HalftoneOffsetX,
     HalftoneOffsetY,
+    HalftoneOffsetPoint,
     Backend,
     Quality,
+    Sampling,
     EdgeMode,
     ExpandBounds,
+    TransparentMode,
 }
 
 #[derive(Default)]
@@ -100,8 +102,11 @@ pub const CMYK_DOT_LINE: u32 = 2;
 pub const CMYK_DOT_DIAMOND: u32 = 3;
 pub const CMYK_QUALITY_DRAFT: u32 = 0;
 pub const CMYK_QUALITY_FULL: u32 = 1;
+pub const CMYK_SAMPLING_BILINEAR: u32 = 1;
+pub const CMYK_SAMPLING_NEAREST: u32 = 2;
 pub const CMYK_EDGE_TRANSPARENT: u32 = 0;
 pub const CMYK_EDGE_CLAMP: u32 = 1;
+pub const CMYK_EDGE_MIRROR: u32 = 2;
 
 const PRESET_DEFAULT_DOTS: i32 = 1;
 const VIEW_COMPOSITE: i32 = 1;
@@ -122,8 +127,11 @@ const BACKEND_CPU: i32 = 2;
 const BACKEND_GPU: i32 = 3;
 const QUALITY_DRAFT: i32 = 1;
 const QUALITY_FULL: i32 = 2;
+const SAMPLING_BILINEAR: i32 = 1;
+const SAMPLING_NEAREST: i32 = 2;
 const EDGE_TRANSPARENT: i32 = 1;
 const EDGE_CLAMP: i32 = 2;
+const EDGE_MIRROR: i32 = 3;
 const DEFAULT_CMY_INK_AMOUNT: f32 = 1.0;
 const DEFAULT_BLACK_INK_AMOUNT: f32 = 1.0;
 
@@ -152,7 +160,7 @@ const ILLUSTRATOR_INK_COLORS: [[f32; 3]; PLATE_COUNT] = [
     ILLUSTRATOR_INK_COLOR_YELLOW,
     ILLUSTRATOR_INK_COLOR_BLACK,
 ];
-const DEFAULT_HALFTONE_DOT_GAIN: f32 = -0.15;
+const DEFAULT_HALFTONE_DOT_GAIN: f32 = 0.0;
 const DEFAULT_INK_AMOUNTS: [f32; PLATE_COUNT] = [
     DEFAULT_CMY_INK_AMOUNT,
     DEFAULT_CMY_INK_AMOUNT,
@@ -181,7 +189,7 @@ impl AdobePluginGlobal for Plugin {
                         f.set_default(PRESET_DEFAULT_DOTS);
                     }),
                     ae::ParamFlag::SUPERVISE,
-                    ae::ParamUIFlags::empty(),
+                    ae::ParamUIFlags::DISABLED,
                 )?;
                 Ok(())
             },
@@ -227,12 +235,41 @@ impl AdobePluginGlobal for Plugin {
                 )?;
                 params.add(
                     Params::TransparentMode,
-                    "Transparent Mode",
+                    "Paper Background",
                     ae::CheckBoxDef::setup(|f| {
-                        f.set_default(false);
-                        f.set_label("White transparent");
+                        f.set_default(true);
+                        f.set_label("Show paper background");
                     }),
                 )?;
+                Ok(())
+            },
+        )?;
+
+        params.add_group(
+            Params::InkColorStart,
+            Params::InkColorEnd,
+            "Ink Color",
+            true,
+            |params| {
+                add_color_param(
+                    params,
+                    Params::InkColorCyan,
+                    "Cyan Color",
+                    rgb8(0, 255, 255),
+                )?;
+                add_color_param(
+                    params,
+                    Params::InkColorMagenta,
+                    "Magenta Color",
+                    rgb8(255, 0, 255),
+                )?;
+                add_color_param(
+                    params,
+                    Params::InkColorYellow,
+                    "Yellow Color",
+                    rgb8(255, 255, 0),
+                )?;
+                add_color_param(params, Params::InkColorBlack, "Black Color", rgb8(0, 0, 0))?;
                 Ok(())
             },
         )?;
@@ -299,35 +336,6 @@ impl AdobePluginGlobal for Plugin {
         )?;
 
         params.add_group(
-            Params::InkColorStart,
-            Params::InkColorEnd,
-            "Ink Color",
-            true,
-            |params| {
-                add_color_param(
-                    params,
-                    Params::InkColorCyan,
-                    "Cyan Color",
-                    rgb8(0, 255, 255),
-                )?;
-                add_color_param(
-                    params,
-                    Params::InkColorMagenta,
-                    "Magenta Color",
-                    rgb8(255, 0, 255),
-                )?;
-                add_color_param(
-                    params,
-                    Params::InkColorYellow,
-                    "Yellow Color",
-                    rgb8(255, 255, 0),
-                )?;
-                add_color_param(params, Params::InkColorBlack, "Black Color", rgb8(0, 0, 0))?;
-                Ok(())
-            },
-        )?;
-
-        params.add_group(
             Params::RegistrationStart,
             Params::RegistrationEnd,
             "Registration Offset",
@@ -362,16 +370,36 @@ impl AdobePluginGlobal for Plugin {
                 params.add(
                     Params::RandomSeed,
                     "Seed",
-                    ae::SliderDef::setup(|f| {
-                        f.set_valid_min(0);
-                        f.set_valid_max(2_147_483_647);
-                        f.set_slider_min(0);
-                        f.set_slider_max(9999);
-                        f.set_default(0);
+                    ae::FloatSliderDef::setup(|f| {
+                        f.set_valid_min(0.0);
+                        f.set_valid_max(2_147_483_647.0);
+                        f.set_slider_min(0.0);
+                        f.set_slider_max(100.0);
+                        f.set_default(0.0);
+                        f.set_precision(0);
+                        f.set_curve_tolerance(1.0);
                     }),
                 )?;
-                add_px_param(params, Params::RandomAmountX, "Amount X", 3.0, 0.0, 1000.0)?;
-                add_px_param(params, Params::RandomAmountY, "Amount Y", 3.0, 0.0, 1000.0)?;
+                add_px_param_with_slider_range(
+                    params,
+                    Params::RandomAmountX,
+                    "Amount X",
+                    3.0,
+                    0.0,
+                    1000.0,
+                    0.0,
+                    100.0,
+                )?;
+                add_px_param_with_slider_range(
+                    params,
+                    Params::RandomAmountY,
+                    "Amount Y",
+                    3.0,
+                    0.0,
+                    1000.0,
+                    0.0,
+                    100.0,
+                )?;
                 add_bool_param(params, Params::RandomAffectCyan, "Affect Cyan", true)?;
                 add_bool_param(params, Params::RandomAffectMagenta, "Affect Magenta", true)?;
                 add_bool_param(params, Params::RandomAffectYellow, "Affect Yellow", true)?;
@@ -414,7 +442,7 @@ impl AdobePluginGlobal for Plugin {
                     params,
                     Params::HalftoneSoftness,
                     "Softness",
-                    10.0,
+                    0.0,
                     0.0,
                     100.0,
                 )?;
@@ -422,21 +450,16 @@ impl AdobePluginGlobal for Plugin {
                 add_angle_param(params, Params::HalftoneMagentaAngle, "Magenta Angle", 75.0)?;
                 add_angle_param(params, Params::HalftoneYellowAngle, "Yellow Angle", 0.0)?;
                 add_angle_param(params, Params::HalftoneBlackAngle, "Black Angle", 45.0)?;
-                add_px_param(
-                    params,
-                    Params::HalftoneOffsetX,
-                    "Offset X",
-                    0.0,
-                    -10_000.0,
-                    10_000.0,
-                )?;
-                add_px_param(
-                    params,
-                    Params::HalftoneOffsetY,
-                    "Offset Y",
-                    0.0,
-                    -10_000.0,
-                    10_000.0,
+                add_hidden_px_param(params, Params::HalftoneOffsetX, "Legacy Offset X", 0.0)?;
+                add_hidden_px_param(params, Params::HalftoneOffsetY, "Legacy Offset Y", 0.0)?;
+                params.add(
+                    Params::HalftoneOffsetPoint,
+                    "Offset",
+                    ae::PointDef::setup(|f| {
+                        f.set_default((50.0, 50.0));
+                        f.set_value(f.default());
+                        f.set_restrict_bounds(false);
+                    }),
                 )?;
                 Ok(())
             },
@@ -465,10 +488,18 @@ impl AdobePluginGlobal for Plugin {
                     }),
                 )?;
                 params.add(
+                    Params::Sampling,
+                    "Sampling",
+                    ae::PopupDef::setup(|f| {
+                        f.set_options(&["Bilinear", "Nearest"]);
+                        f.set_default(SAMPLING_BILINEAR);
+                    }),
+                )?;
+                params.add(
                     Params::EdgeMode,
                     "Edge Mode",
                     ae::PopupDef::setup(|f| {
-                        f.set_options(&["Transparent", "Clamp Edge"]);
+                        f.set_options(&["None", "Stretch", "Mirror"]);
                         f.set_default(EDGE_TRANSPARENT);
                     }),
                 )?;
@@ -510,12 +541,13 @@ impl AdobePluginGlobal for Plugin {
                 mut out_layer,
             } => {
                 let src = layer_to_frame(&in_layer);
-                let ep = get_params(params)?;
+                let mut ep = get_params(params)?;
+                center_halftone_offset(&mut ep, src.w, src.h);
                 let out = render_cmyk_press(&src, &ep);
                 frame_to_layer(&out, &mut out_layer);
             }
             ae::Command::SmartPreRender { mut extra } => {
-                smart_pre_render(&in_data, &mut extra)?;
+                smart_pre_render(&in_data, &mut extra, params)?;
             }
             ae::Command::SmartRender { extra } => {
                 smart_render(&extra, params)?;
@@ -530,6 +562,7 @@ impl AdobePluginGlobal for Plugin {
                 gpu_device_setdown(&mut extra)?;
             }
             ae::Command::UpdateParamsUi => {
+                update_preset_ui(params)?;
                 update_ink_color_ui(params)?;
                 out_data.set_out_flag(ae::OutFlags::RefreshUi, true);
             }
@@ -541,6 +574,14 @@ impl AdobePluginGlobal for Plugin {
 
         Ok(())
     }
+}
+
+fn update_preset_ui(params: &mut ae::Parameters<Params>) -> Result<(), ae::Error> {
+    let mut params_copy = params.cloned();
+    let mut preset = params_copy.get_mut(Params::Preset)?;
+    preset.set_ui_flag(ae::ParamUIFlags::DISABLED, true);
+    preset.update_param_ui()?;
+    Ok(())
 }
 
 fn update_ink_color_ui(params: &mut ae::Parameters<Params>) -> Result<(), ae::Error> {
@@ -617,6 +658,18 @@ fn add_px_param(
     min: f32,
     max: f32,
 ) -> Result<(), ae::Error> {
+    add_px_param_with_precision(params, id, name, default, min, max, 2)
+}
+
+fn add_px_param_with_precision(
+    params: &mut ae::Parameters<Params>,
+    id: Params,
+    name: &str,
+    default: f32,
+    min: f32,
+    max: f32,
+    precision: i16,
+) -> Result<(), ae::Error> {
     params.add(
         id,
         name,
@@ -625,6 +678,30 @@ fn add_px_param(
             f.set_valid_max(max);
             f.set_slider_min(min);
             f.set_slider_max(max);
+            f.set_default(default.into());
+            f.set_precision(precision);
+        }),
+    )
+}
+
+fn add_px_param_with_slider_range(
+    params: &mut ae::Parameters<Params>,
+    id: Params,
+    name: &str,
+    default: f32,
+    min: f32,
+    max: f32,
+    slider_min: f32,
+    slider_max: f32,
+) -> Result<(), ae::Error> {
+    params.add(
+        id,
+        name,
+        ae::FloatSliderDef::setup(|f| {
+            f.set_valid_min(min);
+            f.set_valid_max(max);
+            f.set_slider_min(slider_min);
+            f.set_slider_max(slider_max);
             f.set_default(default.into());
             f.set_precision(2);
         }),
@@ -637,7 +714,29 @@ fn add_offset_param(
     name: &str,
     default: f32,
 ) -> Result<(), ae::Error> {
-    add_px_param(params, id, name, default, -100.0, 100.0)
+    add_px_param_with_slider_range(params, id, name, default, -1000.0, 1000.0, -100.0, 100.0)
+}
+
+fn add_hidden_px_param(
+    params: &mut ae::Parameters<Params>,
+    id: Params,
+    name: &str,
+    default: f32,
+) -> Result<(), ae::Error> {
+    params.add_with_flags(
+        id,
+        name,
+        ae::FloatSliderDef::setup(|f| {
+            f.set_valid_min(-1_000_000.0);
+            f.set_valid_max(1_000_000.0);
+            f.set_slider_min(-1000.0);
+            f.set_slider_max(1000.0);
+            f.set_default(default.into());
+            f.set_precision(2);
+        }),
+        ae::ParamFlag::empty(),
+        ae::ParamUIFlags::NO_ECW_UI,
+    )
 }
 
 fn add_angle_param(
@@ -646,7 +745,14 @@ fn add_angle_param(
     name: &str,
     default: f32,
 ) -> Result<(), ae::Error> {
-    add_px_param(params, id, name, default, 0.0, 180.0)
+    params.add(
+        id,
+        name,
+        ae::AngleDef::setup(|f| {
+            f.set_default(default);
+            f.set_value(f.default());
+        }),
+    )
 }
 
 fn add_color_param(
@@ -710,31 +816,49 @@ fn get_params(params: &ae::Parameters<Params>) -> Result<EffectParams, ae::Error
         paper: apply_paper_controls(paper_base, brightness),
         offsets: [
             [
-                float_param(params, Params::CyanOffsetX)?.clamp(-100.0, 100.0),
-                float_param(params, Params::CyanOffsetY)?.clamp(-100.0, 100.0),
+                float_param(params, Params::CyanOffsetX)?
+                    .round()
+                    .clamp(-1000.0, 1000.0),
+                float_param(params, Params::CyanOffsetY)?
+                    .round()
+                    .clamp(-1000.0, 1000.0),
             ],
             [
-                float_param(params, Params::MagentaOffsetX)?.clamp(-100.0, 100.0),
-                float_param(params, Params::MagentaOffsetY)?.clamp(-100.0, 100.0),
+                float_param(params, Params::MagentaOffsetX)?
+                    .round()
+                    .clamp(-1000.0, 1000.0),
+                float_param(params, Params::MagentaOffsetY)?
+                    .round()
+                    .clamp(-1000.0, 1000.0),
             ],
             [
-                float_param(params, Params::YellowOffsetX)?.clamp(-100.0, 100.0),
-                float_param(params, Params::YellowOffsetY)?.clamp(-100.0, 100.0),
+                float_param(params, Params::YellowOffsetX)?
+                    .round()
+                    .clamp(-1000.0, 1000.0),
+                float_param(params, Params::YellowOffsetY)?
+                    .round()
+                    .clamp(-1000.0, 1000.0),
             ],
             [
-                float_param(params, Params::BlackOffsetX)?.clamp(-100.0, 100.0),
-                float_param(params, Params::BlackOffsetY)?.clamp(-100.0, 100.0),
+                float_param(params, Params::BlackOffsetX)?
+                    .round()
+                    .clamp(-1000.0, 1000.0),
+                float_param(params, Params::BlackOffsetY)?
+                    .round()
+                    .clamp(-1000.0, 1000.0),
             ],
         ],
         random_enabled: params.get(Params::RandomEnable)?.as_checkbox()?.value(),
-        random_seed: params
-            .get(Params::RandomSeed)?
-            .as_slider()?
-            .value()
-            .clamp(0, 2_147_483_647) as u32,
+        random_seed: float_param(params, Params::RandomSeed)?
+            .round()
+            .clamp(0.0, 2_147_483_647.0) as u32,
         random_amount: [
-            float_param(params, Params::RandomAmountX)?.clamp(0.0, 1000.0),
-            float_param(params, Params::RandomAmountY)?.clamp(0.0, 1000.0),
+            float_param(params, Params::RandomAmountX)?
+                .round()
+                .clamp(0.0, 1000.0),
+            float_param(params, Params::RandomAmountY)?
+                .round()
+                .clamp(0.0, 1000.0),
         ],
         random_affect: [
             params.get(Params::RandomAffectCyan)?.as_checkbox()?.value(),
@@ -762,27 +886,46 @@ fn get_params(params: &ae::Parameters<Params>) -> Result<EffectParams, ae::Error
         halftone_dot_gain: percent(params, Params::HalftoneDotGain, -1.0, 1.0)?,
         halftone_softness: percent(params, Params::HalftoneSoftness, 0.0, 1.0)?,
         halftone_angles: [
-            float_param(params, Params::HalftoneCyanAngle)?.clamp(0.0, 180.0),
-            float_param(params, Params::HalftoneMagentaAngle)?.clamp(0.0, 180.0),
-            float_param(params, Params::HalftoneYellowAngle)?.clamp(0.0, 180.0),
-            float_param(params, Params::HalftoneBlackAngle)?.clamp(0.0, 180.0),
+            angle_param(params, Params::HalftoneCyanAngle)?.rem_euclid(180.0),
+            angle_param(params, Params::HalftoneMagentaAngle)?.rem_euclid(180.0),
+            angle_param(params, Params::HalftoneYellowAngle)?.rem_euclid(180.0),
+            angle_param(params, Params::HalftoneBlackAngle)?.rem_euclid(180.0),
         ],
-        halftone_offset: [
-            float_param(params, Params::HalftoneOffsetX)?,
-            float_param(params, Params::HalftoneOffsetY)?,
-        ],
+        halftone_offset: {
+            let point = point_param(params, Params::HalftoneOffsetPoint)?;
+            let legacy = [
+                float_param(params, Params::HalftoneOffsetX).unwrap_or(0.0),
+                float_param(params, Params::HalftoneOffsetY).unwrap_or(0.0),
+            ];
+            [point[0] + legacy[0], point[1] + legacy[1]]
+        },
         backend: normalize_backend(params.get(Params::Backend)?.as_popup()?.value() as i32),
         quality: normalize_quality(params.get(Params::Quality)?.as_popup()?.value() as i32),
+        sampling_mode: normalize_sampling(params.get(Params::Sampling)?.as_popup()?.value() as i32),
         edge_mode: normalize_edge_mode(params.get(Params::EdgeMode)?.as_popup()?.value() as i32),
         expand_bounds: params.get(Params::ExpandBounds)?.as_checkbox()?.value(),
         conversion_mode,
         ink_colors,
-        transparent_mode: params.get(Params::TransparentMode)?.as_checkbox()?.value(),
+        transparent_mode: !params.get(Params::TransparentMode)?.as_checkbox()?.value(),
     })
 }
 
 fn float_param(params: &ae::Parameters<Params>, param: Params) -> Result<f32, ae::Error> {
     Ok(params.get(param)?.as_float_slider()?.value() as f32)
+}
+
+fn angle_param(params: &ae::Parameters<Params>, param: Params) -> Result<f32, ae::Error> {
+    let param_ref = params.get(param)?;
+    let angle = param_ref.as_angle()?;
+    angle
+        .float_value()
+        .map(|value| value as f32)
+        .or_else(|_| Ok(angle.value()))
+}
+
+fn point_param(params: &ae::Parameters<Params>, param: Params) -> Result<[f32; 2], ae::Error> {
+    let point = params.get(param)?.as_point()?.float_value()?;
+    Ok([point.x as f32, point.y as f32])
 }
 
 fn percent(
@@ -831,9 +974,16 @@ fn normalize_quality(value: i32) -> i32 {
     }
 }
 
+fn normalize_sampling(value: i32) -> i32 {
+    match value {
+        SAMPLING_BILINEAR | SAMPLING_NEAREST => value,
+        _ => SAMPLING_BILINEAR,
+    }
+}
+
 fn normalize_edge_mode(value: i32) -> i32 {
     match value {
-        EDGE_CLAMP => value,
+        EDGE_CLAMP | EDGE_MIRROR => value,
         _ => EDGE_TRANSPARENT,
     }
 }
@@ -853,9 +1003,15 @@ fn apply_paper_controls(rgb: [f32; 3], brightness: f32) -> [f32; 3] {
     ]
 }
 
+fn center_halftone_offset(ep: &mut EffectParams, width: usize, height: usize) {
+    ep.halftone_offset[0] = width as f32 * 0.5 - ep.halftone_offset[0];
+    ep.halftone_offset[1] = height as f32 * 0.5 - ep.halftone_offset[1];
+}
+
 fn smart_pre_render(
     in_data: &ae::InData,
     extra: &mut ae::pf::PreRenderExtra,
+    params: &ae::Parameters<Params>,
 ) -> Result<(), ae::Error> {
     let req = extra.output_request();
     let cb = extra.callbacks();
@@ -869,14 +1025,18 @@ fn smart_pre_render(
     )?;
 
     let req_rect: ae::Rect = req.rect.into();
-    let res: ae::Rect = in_result.result_rect.into();
     let max_res: ae::Rect = in_result.max_result_rect.into();
 
-    // Use the full available rect so that edge sampling (clamp/transparent)
-    // and registration offsets can access pixels outside the output rect.
-    extra.set_result_rect(res);
-    extra.set_max_result_rect(max_res);
-    let _ = req_rect;
+    if get_params(params)
+        .map(|ep| ep.expand_bounds)
+        .unwrap_or(true)
+    {
+        extra.set_result_rect(max_res);
+        extra.set_max_result_rect(max_res);
+    } else {
+        extra.set_result_rect(req_rect);
+        extra.set_max_result_rect(req_rect);
+    }
     extra.set_gpu_render_possible(gpu_prerender_possible(extra));
     Ok(())
 }
@@ -885,12 +1045,13 @@ fn smart_render(
     extra: &ae::pf::SmartRenderExtra,
     params: &ae::Parameters<Params>,
 ) -> Result<(), ae::Error> {
-    let ep = get_params(params)?;
+    let mut ep = get_params(params)?;
     let cb = extra.callbacks();
     let input_world = cb.checkout_layer_pixels(0)?.ok_or(ae::Error::Generic)?;
     let result = (|| {
         let mut output_world = cb.checkout_output()?.ok_or(ae::Error::Generic)?;
         let src = layer_to_frame(&input_world);
+        center_halftone_offset(&mut ep, src.w, src.h);
         let out = render_cmyk_press(&src, &ep);
         frame_to_layer(&out, &mut output_world);
         Ok(())
@@ -922,7 +1083,7 @@ fn smart_render_gpu(
         return Err(ae::Error::Generic);
     }
 
-    let ep = get_params(params)?;
+    let mut ep = get_params(params)?;
     if ep.backend == BACKEND_CPU {
         return Err(ae::Error::Generic);
     }
@@ -934,6 +1095,11 @@ fn smart_render_gpu(
     let mut input_world = cb.checkout_layer_pixels(0)?.ok_or(ae::Error::Generic)?;
     let result = (|| {
         let mut output_world = cb.checkout_output()?.ok_or(ae::Error::Generic)?;
+        center_halftone_offset(
+            &mut ep,
+            input_world.width() as usize,
+            input_world.height() as usize,
+        );
         state.render(in_data, &mut input_world, &mut output_world, &ep)
     })();
     cb.checkin_layer_pixels(0)?;
@@ -1006,14 +1172,12 @@ fn layer_to_frame(layer: &ae::Layer) -> Frame {
             for y in 0..h {
                 for x in 0..w {
                     let p = layer.as_pixel16(x, y);
-                    pixels[y * w + x] = Rgba {
-                        rgb: [
-                            p.red as f32 * scale,
-                            p.green as f32 * scale,
-                            p.blue as f32 * scale,
-                        ],
-                        a: p.alpha as f32 * scale,
-                    };
+                    pixels[y * w + x] = rgba_from_straight(
+                        p.red as f32 * scale,
+                        p.green as f32 * scale,
+                        p.blue as f32 * scale,
+                        p.alpha as f32 * scale,
+                    );
                 }
             }
         }
@@ -1021,14 +1185,7 @@ fn layer_to_frame(layer: &ae::Layer) -> Frame {
             for y in 0..h {
                 for x in 0..w {
                     let p = layer.as_pixel32(x, y);
-                    pixels[y * w + x] = Rgba {
-                        rgb: [
-                            p.red.clamp(0.0, 1.0),
-                            p.green.clamp(0.0, 1.0),
-                            p.blue.clamp(0.0, 1.0),
-                        ],
-                        a: p.alpha.clamp(0.0, 1.0),
-                    };
+                    pixels[y * w + x] = rgba_from_straight(p.red, p.green, p.blue, p.alpha);
                 }
             }
         }
@@ -1044,14 +1201,12 @@ fn layer_to_frame(layer: &ae::Layer) -> Frame {
                 let row = &buf[src_off..src_off + row_len];
                 for x in 0..w {
                     let off = x * 4;
-                    pixels[y * w + x] = Rgba {
-                        rgb: [
-                            row[off + 1] as f32 / 255.0,
-                            row[off + 2] as f32 / 255.0,
-                            row[off + 3] as f32 / 255.0,
-                        ],
-                        a: row[off] as f32 / 255.0,
-                    };
+                    pixels[y * w + x] = rgba_from_straight(
+                        row[off + 1] as f32 / 255.0,
+                        row[off + 2] as f32 / 255.0,
+                        row[off + 3] as f32 / 255.0,
+                        row[off] as f32 / 255.0,
+                    );
                 }
             }
         }
@@ -1069,11 +1224,12 @@ fn frame_to_layer(frame: &Frame, layer: &mut ae::Layer) {
             for y in 0..h {
                 for x in 0..w {
                     let px = frame.pixels[y * frame.w + x];
+                    let rgb = straight_rgb_from_rgba(px);
                     let out = layer.as_pixel16_mut(x, y);
                     out.alpha = to_u16(px.a);
-                    out.red = to_u16(px.rgb[0]);
-                    out.green = to_u16(px.rgb[1]);
-                    out.blue = to_u16(px.rgb[2]);
+                    out.red = to_u16(rgb[0]);
+                    out.green = to_u16(rgb[1]);
+                    out.blue = to_u16(rgb[2]);
                 }
             }
         }
@@ -1081,11 +1237,12 @@ fn frame_to_layer(frame: &Frame, layer: &mut ae::Layer) {
             for y in 0..h {
                 for x in 0..w {
                     let px = frame.pixels[y * frame.w + x];
+                    let rgb = straight_rgb_from_rgba(px);
                     let out = layer.as_pixel32_mut(x, y);
                     out.alpha = px.a.clamp(0.0, 1.0);
-                    out.red = px.rgb[0].clamp(0.0, 1.0);
-                    out.green = px.rgb[1].clamp(0.0, 1.0);
-                    out.blue = px.rgb[2].clamp(0.0, 1.0);
+                    out.red = rgb[0];
+                    out.green = rgb[1];
+                    out.blue = rgb[2];
                 }
             }
         }
@@ -1101,15 +1258,39 @@ fn frame_to_layer(frame: &Frame, layer: &mut ae::Layer) {
                 let row = &mut buf[dst_off..dst_off + row_len];
                 for x in 0..w {
                     let px = frame.pixels[y * frame.w + x];
+                    let rgb = straight_rgb_from_rgba(px);
                     let off = x * 4;
                     row[off] = to_u8(px.a);
-                    row[off + 1] = to_u8(px.rgb[0]);
-                    row[off + 2] = to_u8(px.rgb[1]);
-                    row[off + 3] = to_u8(px.rgb[2]);
+                    row[off + 1] = to_u8(rgb[0]);
+                    row[off + 2] = to_u8(rgb[1]);
+                    row[off + 3] = to_u8(rgb[2]);
                 }
             }
         }
     }
+}
+
+fn rgba_from_straight(red: f32, green: f32, blue: f32, alpha: f32) -> Rgba {
+    let a = alpha.clamp(0.0, 1.0);
+    Rgba {
+        rgb: [
+            red.clamp(0.0, 1.0) * a,
+            green.clamp(0.0, 1.0) * a,
+            blue.clamp(0.0, 1.0) * a,
+        ],
+        a,
+    }
+}
+
+fn straight_rgb_from_rgba(px: Rgba) -> [f32; 3] {
+    if px.a <= 0.0001 {
+        return [0.0, 0.0, 0.0];
+    }
+    [
+        (px.rgb[0] / px.a).clamp(0.0, 1.0),
+        (px.rgb[1] / px.a).clamp(0.0, 1.0),
+        (px.rgb[2] / px.a).clamp(0.0, 1.0),
+    ]
 }
 
 fn to_u8(v: f32) -> u8 {
@@ -1118,6 +1299,27 @@ fn to_u8(v: f32) -> u8 {
 
 fn to_u16(v: f32) -> u16 {
     (v.clamp(0.0, 1.0) * ae::MAX_CHANNEL16 as f32 + 0.5) as u16
+}
+
+#[cfg(test)]
+mod ae_pixel_boundary_tests {
+    use super::*;
+
+    #[test]
+    fn ae_straight_pixels_are_premultiplied_for_internal_sampling() {
+        let px = rgba_from_straight(1.0, 0.0, 0.0, 0.25);
+        assert_eq!(px.rgb, [0.25, 0.0, 0.0]);
+        assert_eq!(px.a, 0.25);
+    }
+
+    #[test]
+    fn internal_premultiplied_pixels_are_unpremultiplied_for_ae_output() {
+        let rgb = straight_rgb_from_rgba(Rgba {
+            rgb: [0.25, 0.0, 0.0],
+            a: 0.25,
+        });
+        assert_eq!(rgb, [1.0, 0.0, 0.0]);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1153,6 +1355,7 @@ mod metal_gpu {
         halftone_dot_gain: f32,
         halftone_softness: f32,
         quality: i32,
+        sampling_mode: i32,
         edge_mode: i32,
         conversion_mode: i32,
         paper: [f32; 4],
@@ -1178,6 +1381,7 @@ mod metal_gpu {
                 halftone_dot_gain: ep.halftone_dot_gain,
                 halftone_softness: ep.halftone_softness,
                 quality: ep.quality,
+                sampling_mode: ep.sampling_mode,
                 edge_mode: ep.edge_mode,
                 conversion_mode: ep.conversion_mode,
                 paper: [ep.paper[0], ep.paper[1], ep.paper[2], 1.0],
@@ -1390,6 +1594,9 @@ constant int VIEW_BLACK = 5;
 constant int VIEW_INK_COVERAGE = 6;
 constant int VIEW_SPLIT = 7;
 constant int EDGE_CLAMP = 2;
+constant int EDGE_MIRROR = 3;
+constant int SAMPLING_BILINEAR = 1;
+constant int SAMPLING_NEAREST = 2;
 constant int CONVERSION_ILLUSTRATOR = 2;
 constant int CONVERSION_CUSTOM = 3;
 
@@ -1416,6 +1623,7 @@ struct Params {
     float halftone_dot_gain;
     float halftone_softness;
     int quality;
+    int sampling_mode;
     int edge_mode;
     int conversion_mode;
     float4 paper;
@@ -1428,8 +1636,23 @@ struct Params {
 constexpr sampler nearest_sampler(coord::pixel, address::clamp_to_edge, filter::nearest);
 constexpr sampler linear_sampler(coord::pixel, address::clamp_to_edge, filter::linear);
 
+static inline float4 premultiply_sample(float4 px) {
+    px = saturate(px);
+    return float4(px.rgb * px.a, px.a);
+}
+
 static inline float4 sample_pixel(texture2d<float, access::sample> src, uint2 pos) {
-    return saturate(src.read(pos));
+    return premultiply_sample(src.read(pos));
+}
+
+static inline float mirror_coord(float value, uint len) {
+    if (len <= 1) {
+        return 0.0;
+    }
+    float max_coord = float(len - 1);
+    float period = max_coord * 2.0;
+    float wrapped = fmod(fmod(value, period) + period, period);
+    return wrapped > max_coord ? period - wrapped : wrapped;
 }
 
 static inline float4 sample_nearest(texture2d<float, access::sample> src, float2 pos, uint width, uint height, int edge_mode) {
@@ -1438,6 +1661,8 @@ static inline float4 sample_nearest(texture2d<float, access::sample> src, float2
     }
     if (edge_mode == EDGE_CLAMP) {
         pos = clamp(pos, float2(0.0), float2(float(width - 1), float(height - 1)));
+    } else if (edge_mode == EDGE_MIRROR) {
+        pos = float2(mirror_coord(pos.x, width), mirror_coord(pos.y, height));
     } else if (pos.x < 0.0 || pos.y < 0.0 || pos.x > float(width - 1) || pos.y > float(height - 1)) {
         return float4(0.0);
     }
@@ -1450,10 +1675,30 @@ static inline float4 sample_bilinear(texture2d<float, access::sample> src, float
     }
     if (edge_mode == EDGE_CLAMP) {
         pos = clamp(pos, float2(0.0), float2(float(width - 1), float(height - 1)));
+    } else if (edge_mode == EDGE_MIRROR) {
+        pos = float2(mirror_coord(pos.x, width), mirror_coord(pos.y, height));
     } else if (pos.x < 0.0 || pos.y < 0.0 || pos.x > float(width - 1) || pos.y > float(height - 1)) {
         return float4(0.0);
     }
-    return saturate(src.sample(linear_sampler, pos));
+    uint x0 = uint(floor(pos.x));
+    uint y0 = uint(floor(pos.y));
+    uint x1 = min(x0 + 1, width - 1);
+    uint y1 = min(y0 + 1, height - 1);
+    float tx = pos.x - float(x0);
+    float ty = pos.y - float(y0);
+
+    float4 a = sample_pixel(src, uint2(x0, y0));
+    float4 b = sample_pixel(src, uint2(x1, y0));
+    float4 c = sample_pixel(src, uint2(x0, y1));
+    float4 d = sample_pixel(src, uint2(x1, y1));
+    return mix(mix(a, b, tx), mix(c, d, tx), ty);
+}
+
+static inline bool use_nearest_sampling(constant Params& params) {
+    if (params.sampling_mode == SAMPLING_NEAREST) {
+        return true;
+    }
+    return false;
 }
 
 static inline float3 unpremultiply_rgb(float4 px) {
@@ -1505,11 +1750,12 @@ static inline float dot_radius(float value) {
 
 static inline float dot_edge_width(float cell, float softness) {
     float cell_aa = 0.5 / max(cell, 1.0);
-    return max(cell_aa + clamp(softness, 0.0, 1.0) * 0.03, 0.0001);
+    return max(cell_aa + clamp(softness, 0.0, 1.0) * 0.12, 0.0001);
 }
 
 static inline float smooth_circle(float dist, float radius, float edge) {
-    return clamp((radius + edge - dist) / (2.0 * edge), 0.0, 1.0);
+    float t = clamp((radius + edge - dist) / (2.0 * edge), 0.0, 1.0);
+    return t * t * (3.0 - 2.0 * t);
 }
 
 static inline float4 rgb_to_cmyk_controls(float3 rgb, constant Params& params) {
@@ -1577,29 +1823,28 @@ static inline float3 composite(float4 inks, constant Params& params) {
                            params.paper.b * clamp(1.0 - inks.z, 0.0, 1.0) * clamp(1.0 - inks.w, 0.0, 1.0)));
 }
 
-static inline float cmyk_smoothstep(float t) {
+static inline float smooth_step(float t) {
     t = clamp(t, 0.0, 1.0);
     return t * t * (3.0 - 2.0 * t);
 }
 
-static inline float4 apply_white_transparency(float3 rgb, float alpha, constant Params& params) {
+static inline float4 composite_preview_to_output(float3 rgb, float alpha, constant Params& params) {
     alpha = clamp(alpha, 0.0, 1.0);
-    if (params.transparent_mode == 0 || alpha <= 0.0) {
-        return float4(rgb, alpha);
+    if (params.transparent_mode != 0 && alpha > 0.0) {
+        rgb = saturate(rgb);
+        float3 paper = saturate(params.paper.rgb);
+        float3 delta = rgb - paper;
+        float3 denom_dark = max(paper, float3(0.0001));
+        float3 denom_light = max(float3(1.0) - paper, float3(0.0001));
+        float3 channel_alpha = select(abs(delta) / denom_light, abs(delta) / denom_dark, delta < 0.0);
+        float matte_alpha = clamp(max(max(channel_alpha.r, channel_alpha.g), channel_alpha.b), 0.0, 1.0);
+        if (matte_alpha <= 0.0001) {
+            return float4(0.0);
+        }
+        rgb = saturate((rgb - paper * (1.0 - matte_alpha)) / matte_alpha);
+        alpha *= smooth_step(matte_alpha);
     }
-    rgb = saturate(rgb);
-    float3 white_delta = 1.0 - rgb;
-    float matte_alpha = max(max(white_delta.r, white_delta.g), white_delta.b);
-    if (matte_alpha <= 0.0001) {
-        return float4(0.0);
-    }
-    float3 recovered_rgb = saturate(1.0 - white_delta / matte_alpha);
-    float threshold = 1.0;
-    float normalized_alpha = clamp(matte_alpha / threshold, 0.0, 1.0);
-    float soft_alpha = cmyk_smoothstep(normalized_alpha);
-    float softness = 0.0;
-    float coverage = normalized_alpha + (soft_alpha - normalized_alpha) * softness;
-    return float4(recovered_rgb, alpha * coverage);
+    return float4(saturate(rgb), alpha);
 }
 
 kernel void cmyk_press(texture2d<float, access::sample> input [[texture(0)]],
@@ -1613,7 +1858,7 @@ kernel void cmyk_press(texture2d<float, access::sample> input [[texture(0)]],
     float2 xy = float2(gid);
     float4 original = sample_pixel(input, gid);
     float4 inks = float4(0.0);
-    float alpha_max = 0.0;
+    float ink_alpha = 0.0;
     for (uint plate = 0; plate < 4; ++plate) {
         constant PlatePlan& plan = params.plates[plate];
         HalftonePoint halftone;
@@ -1621,15 +1866,15 @@ kernel void cmyk_press(texture2d<float, access::sample> input [[texture(0)]],
             halftone = halftone_point(xy, plan, params);
         }
         float2 sample_pos = params.halftone_enabled != 0 ? halftone.sample_pos : xy + plan.shift;
-        float4 sampled = params.quality == 1 ? sample_nearest(input, sample_pos, params.width, params.height, params.edge_mode)
-                                             : sample_bilinear(input, sample_pos, params.width, params.height, params.edge_mode);
-        alpha_max = max(alpha_max, sampled.a);
-        inks[plate] = clamp(rgb_to_cmyk_plate(unpremultiply_rgb(sampled), plate) * sampled.a, 0.0, 2.0);
+        float4 sampled = use_nearest_sampling(params) ? sample_nearest(input, sample_pos, params.width, params.height, params.edge_mode)
+                                                      : sample_bilinear(input, sample_pos, params.width, params.height, params.edge_mode);
+        float plate_ink = sampled.a <= 0.0 ? 0.0 : clamp(rgb_to_cmyk_plate(unpremultiply_rgb(sampled), plate), 0.0, 2.0);
         if (params.halftone_enabled != 0) {
-            inks[plate] = halftone_coverage_from_cell(halftone.cell, inks[plate], plan, params);
+            plate_ink = halftone_coverage_from_cell(halftone.cell, plate_ink, plan, params);
         }
+        inks[plate] = clamp(plate_ink * params.ink_amounts[plate], 0.0, 2.0);
+        ink_alpha = max(ink_alpha, clamp(inks[plate], 0.0, 1.0) * sampled.a);
     }
-    inks = clamp(inks * params.ink_amounts, 0.0, 2.0);
 
     float3 rgb;
     if (params.view_mode == VIEW_CYAN) {
@@ -1649,12 +1894,9 @@ kernel void cmyk_press(texture2d<float, access::sample> input [[texture(0)]],
         rgb = composite(inks, params);
     }
 
-    float alpha = params.preserve_alpha != 0 ? original.a : alpha_max;
+    float alpha = params.preserve_alpha != 0 ? original.a : max(original.a, ink_alpha);
     rgb = mix(rgb, unpremultiply_rgb(original), clamp(params.blend_original, 0.0, 1.0));
-    float4 white_unmult = apply_white_transparency(rgb, alpha, params);
-    rgb = white_unmult.rgb;
-    alpha = white_unmult.a;
-    output.write(float4(saturate(rgb * alpha), clamp(alpha, 0.0, 1.0)), gid);
+    output.write(composite_preview_to_output(rgb, alpha, params), gid);
 }
 
 kernel void cmyk_press_fast(texture2d<float, access::sample> input [[texture(0)]],
@@ -1667,10 +1909,10 @@ kernel void cmyk_press_fast(texture2d<float, access::sample> input [[texture(0)]
 
     float4 original = sample_pixel(input, gid);
     float4 cmyk = rgb_to_cmyk_controls(unpremultiply_rgb(original), params);
-    float4 inks = clamp(cmyk * original.a * params.ink_amounts, 0.0, 2.0);
+    float4 inks = original.a <= 0.0 ? float4(0.0) : clamp(cmyk * params.ink_amounts, 0.0, 2.0);
     float3 rgb = composite(inks, params);
     float alpha = original.a;
-    output.write(float4(saturate(rgb * alpha), clamp(alpha, 0.0, 1.0)), gid);
+    output.write(float4(saturate(rgb), clamp(alpha, 0.0, 1.0)), gid);
 }
 "#;
 }

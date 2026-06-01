@@ -29,6 +29,7 @@ pub struct CmykPressParams {
     pub view_mode: u32,
     pub quality: u32,
     pub edge_mode: u32,
+    pub sampling_mode: u32,
     pub transparent_mode: u32,
 }
 
@@ -51,7 +52,7 @@ impl Default for CmykPressParams {
             halftone_frequency: 8.0,
             halftone_shape: CMYK_DOT_CIRCLE,
             halftone_dot_gain: DEFAULT_HALFTONE_DOT_GAIN,
-            halftone_softness: 0.1,
+            halftone_softness: 0.0,
             halftone_angles: [15.0, 75.0, 0.0, 45.0],
             halftone_offset: [0.0, 0.0],
             paper_color: [1.0, 1.0, 1.0],
@@ -60,6 +61,7 @@ impl Default for CmykPressParams {
             view_mode: CMYK_VIEW_COMPOSITE,
             quality: CMYK_QUALITY_FULL,
             edge_mode: CMYK_EDGE_TRANSPARENT,
+            sampling_mode: CMYK_SAMPLING_BILINEAR,
             transparent_mode: 0,
         }
     }
@@ -88,6 +90,7 @@ pub(crate) struct EffectParams {
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) backend: i32,
     pub(crate) quality: i32,
+    pub(crate) sampling_mode: i32,
     pub(crate) edge_mode: i32,
     pub(crate) expand_bounds: bool,
     pub(crate) conversion_mode: i32,
@@ -119,6 +122,7 @@ pub struct CmykPressOptions {
     pub edge_mode: u32,
     pub conversion_mode: u32,
     pub ink_colors: [[f32; 3]; PLATE_COUNT],
+    pub sampling_mode: u32,
     pub transparent_mode: bool,
 }
 
@@ -140,13 +144,14 @@ impl Default for CmykPressOptions {
             halftone_unit: HALFTONE_UNIT_PIXELS as u32,
             halftone_shape: DOT_CIRCLE as u32,
             halftone_dot_gain: DEFAULT_HALFTONE_DOT_GAIN,
-            halftone_softness: 0.1,
+            halftone_softness: 0.0,
             halftone_angles: [15.0, 75.0, 0.0, 45.0],
             halftone_offset: [0.0, 0.0],
             quality: QUALITY_FULL as u32,
             edge_mode: EDGE_TRANSPARENT as u32,
             conversion_mode: CONVERSION_SIMPLE as u32,
             ink_colors: CUSTOM_INK_COLORS,
+            sampling_mode: SAMPLING_BILINEAR as u32,
             transparent_mode: false,
         }
     }
@@ -192,6 +197,7 @@ impl From<CmykPressParams> for CmykPressOptions {
             halftone_angles: params.halftone_angles,
             halftone_offset: params.halftone_offset,
             quality: public_quality_to_internal(params.quality),
+            sampling_mode: public_sampling_to_internal(params.sampling_mode),
             edge_mode: public_edge_to_internal(params.edge_mode),
             conversion_mode: CONVERSION_SIMPLE as u32,
             ink_colors: CUSTOM_INK_COLORS,
@@ -228,9 +234,18 @@ fn public_quality_to_internal(value: u32) -> u32 {
     }
 }
 
+fn public_sampling_to_internal(value: u32) -> u32 {
+    match value {
+        CMYK_SAMPLING_BILINEAR => SAMPLING_BILINEAR as u32,
+        CMYK_SAMPLING_NEAREST => SAMPLING_NEAREST as u32,
+        _ => SAMPLING_BILINEAR as u32,
+    }
+}
+
 fn public_edge_to_internal(value: u32) -> u32 {
     match value {
         CMYK_EDGE_CLAMP => EDGE_CLAMP as u32,
+        CMYK_EDGE_MIRROR => EDGE_MIRROR as u32,
         _ => EDGE_TRANSPARENT as u32,
     }
 }
@@ -324,7 +339,11 @@ impl CmykPressOptions {
             halftone_offset: self.halftone_offset,
             backend: BACKEND_CPU,
             quality: normalize_quality(self.quality as i32),
-            edge_mode: normalize_edge_mode(self.edge_mode as i32),
+            sampling_mode: normalize_sampling(self.sampling_mode as i32),
+            edge_mode: match self.edge_mode as i32 {
+                EDGE_CLAMP | EDGE_MIRROR => self.edge_mode as i32,
+                _ => EDGE_TRANSPARENT,
+            },
             expand_bounds: false,
             conversion_mode,
             ink_colors,
@@ -362,15 +381,37 @@ pub(crate) fn render_cmyk_press(src: &Frame, ep: &EffectParams) -> Frame {
     let plan = RenderPlan::new(ep, w, h);
     let rows_per_chunk = h.div_ceil(num_cpus::get().max(1).min(h).max(1)).max(1);
 
-    out.par_chunks_mut(rows_per_chunk * w)
-        .enumerate()
-        .for_each(|(chunk_index, out_chunk)| {
-            let y_start = chunk_index * rows_per_chunk;
-            let rows = (out_chunk.len() / w).min(h.saturating_sub(y_start));
-            render_rows(out_chunk, src, y_start, rows, ep, &plan);
-        });
+    let render_chunks = |out: &mut [Rgba]| {
+        out.par_chunks_mut(rows_per_chunk * w)
+            .enumerate()
+            .for_each(|(chunk_index, out_chunk)| {
+                let y_start = chunk_index * rows_per_chunk;
+                let rows = (out_chunk.len() / w).min(h.saturating_sub(y_start));
+                render_rows(out_chunk, src, y_start, rows, ep, &plan);
+            });
+    };
+
+    if let Some(thread_count) = cmyk_press_thread_count() {
+        if let Ok(pool) = rayon::ThreadPoolBuilder::new()
+            .num_threads(thread_count)
+            .build()
+        {
+            pool.install(|| render_chunks(&mut out));
+        } else {
+            render_chunks(&mut out);
+        }
+    } else {
+        render_chunks(&mut out);
+    }
 
     Frame { pixels: out, w, h }
+}
+
+fn cmyk_press_thread_count() -> Option<usize> {
+    std::env::var("CMYK_PRESS_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
 }
 
 fn render_rows(
@@ -381,6 +422,40 @@ fn render_rows(
     ep: &EffectParams,
     plan: &RenderPlan,
 ) {
+    match plan.path {
+        RenderPath::CompositeSingleSample => {
+            render_rows_with(out, src, y_start, rows, |x, _y, _xy, original| {
+                let _ = x;
+                render_composite_single_sample(original, ep)
+            });
+        }
+        RenderPath::GeneralSingleSample => {
+            render_rows_with(out, src, y_start, rows, |x, _y, _xy, original| {
+                render_single_sample_general(original, x as f32, ep, src.w)
+            });
+        }
+        RenderPath::HalftoneCompositeNoPost => {
+            render_rows_with(out, src, y_start, rows, |_, _, xy, original| {
+                render_halftone_composite_no_post(src, xy, original, ep, plan)
+            });
+        }
+        RenderPath::GeneralNoHalftone => {
+            render_rows_with(out, src, y_start, rows, |_, _, xy, original| {
+                render_pixel_no_halftone(src, xy, original, ep, plan)
+            });
+        }
+        RenderPath::General => {
+            render_rows_with(out, src, y_start, rows, |_, _, xy, original| {
+                render_pixel(src, xy, original, ep, plan)
+            });
+        }
+    }
+}
+
+fn render_rows_with<F>(out: &mut [Rgba], src: &Frame, y_start: usize, rows: usize, mut render: F)
+where
+    F: FnMut(usize, usize, [f32; 2], Rgba) -> Rgba,
+{
     let w = src.w;
     let h = src.h;
     let y_end = (y_start + rows).min(h);
@@ -389,13 +464,20 @@ fn render_rows(
         for x in 0..w {
             let xy = [x as f32, y as f32];
             let original = sample_pixel(src, x, y);
-            let printed = match plan.path {
-                RenderPath::CompositeSingleSample => render_composite_single_sample(original, ep),
-                RenderPath::General => render_pixel(src, xy, original, ep, plan),
-            };
-            out[(y - y_start) * w + x] = printed;
+            out[(y - y_start) * w + x] = render(x, y, xy, original);
         }
     }
+}
+
+fn render_single_sample_general(original: Rgba, x: f32, ep: &EffectParams, width: usize) -> Rgba {
+    let cmyk = separate_all_plates(original);
+    let inks = [
+        (cmyk[0] * ep.ink_amounts[0]).clamp(0.0, 2.0),
+        (cmyk[1] * ep.ink_amounts[1]).clamp(0.0, 2.0),
+        (cmyk[2] * ep.ink_amounts[2]).clamp(0.0, 2.0),
+        (cmyk[3] * ep.ink_amounts[3]).clamp(0.0, 2.0),
+    ];
+    finish_preview_pixel(inks, original, x, width, original.a, ep)
 }
 
 fn render_composite_single_sample(original: Rgba, ep: &EffectParams) -> Rgba {
@@ -417,6 +499,38 @@ fn render_composite_single_sample(original: Rgba, ep: &EffectParams) -> Rgba {
     }
 }
 
+fn render_halftone_composite_no_post(
+    src: &Frame,
+    xy: [f32; 2],
+    original: Rgba,
+    ep: &EffectParams,
+    plan: &RenderPlan,
+) -> Rgba {
+    let mut inks = [0.0f32; PLATE_COUNT];
+    for plate in 0..PLATE_COUNT {
+        let halftone = halftone_point(xy, &plan.plates[plate], ep);
+        let pos = halftone.sample_pos;
+        let sampled = if use_nearest_sampling(ep) {
+            sample_nearest(src, pos[0], pos[1], ep.edge_mode)
+        } else {
+            sample_bilinear(src, pos[0], pos[1], ep.edge_mode)
+        };
+        inks[plate] = separate_plate_direct(sampled, plate);
+        inks[plate] =
+            halftone_coverage_from_cell(halftone.cell, inks[plate], &plan.plates[plate], ep);
+        inks[plate] = (inks[plate] * ep.ink_amounts[plate]).clamp(0.0, 2.0);
+    }
+    let rgb = composite_cmyk(inks, ep);
+    Rgba {
+        rgb: [
+            (rgb[0] * original.a).clamp(0.0, 1.0),
+            (rgb[1] * original.a).clamp(0.0, 1.0),
+            (rgb[2] * original.a).clamp(0.0, 1.0),
+        ],
+        a: original.a,
+    }
+}
+
 fn render_pixel(
     src: &Frame,
     xy: [f32; 2],
@@ -425,7 +539,7 @@ fn render_pixel(
     plan: &RenderPlan,
 ) -> Rgba {
     let mut inks = [0.0f32; PLATE_COUNT];
-    let mut alpha_max: f32 = 0.0;
+    let mut ink_alpha: f32 = 0.0;
     for plate in 0..PLATE_COUNT {
         let halftone = if ep.halftone_enabled {
             Some(halftone_point(xy, &plan.plates[plate], ep))
@@ -439,42 +553,99 @@ fn render_pixel(
             ],
             |halftone| halftone.sample_pos,
         );
-        let sampled = if ep.quality == QUALITY_DRAFT {
+        let sampled = if use_nearest_sampling(ep) {
             sample_nearest(src, pos[0], pos[1], ep.edge_mode)
         } else {
             sample_bilinear(src, pos[0], pos[1], ep.edge_mode)
         };
-        alpha_max = alpha_max.max(sampled.a);
-        inks[plate] = separate_plate_direct(sampled, plate);
+        let mut plate_ink = separate_plate_direct(sampled, plate);
         if let Some(halftone) = halftone {
-            inks[plate] =
-                halftone_coverage_from_cell(halftone.cell, inks[plate], &plan.plates[plate], ep);
+            plate_ink =
+                halftone_coverage_from_cell(halftone.cell, plate_ink, &plan.plates[plate], ep);
         }
-    }
-    for plate in 0..PLATE_COUNT {
-        inks[plate] = (inks[plate] * ep.ink_amounts[plate]).clamp(0.0, 2.0);
+        inks[plate] = (plate_ink * ep.ink_amounts[plate]).clamp(0.0, 2.0);
+        ink_alpha = ink_alpha.max(inks[plate].clamp(0.0, 1.0) * sampled.a);
     }
 
-    let mut rgb = preview_rgb(inks, original, xy[0], ep, src.w);
     let alpha = if ep.preserve_alpha {
         original.a
     } else {
-        alpha_max
+        original.a.max(ink_alpha)
+    };
+    finish_preview_pixel(inks, original, xy[0], src.w, alpha, ep)
+}
+
+fn render_pixel_no_halftone(
+    src: &Frame,
+    xy: [f32; 2],
+    original: Rgba,
+    ep: &EffectParams,
+    plan: &RenderPlan,
+) -> Rgba {
+    let mut inks = [0.0f32; PLATE_COUNT];
+    let mut ink_alpha: f32 = 0.0;
+    for plate in 0..PLATE_COUNT {
+        let pos = [
+            xy[0] + plan.plates[plate].shift[0],
+            xy[1] + plan.plates[plate].shift[1],
+        ];
+        let sampled = if use_nearest_sampling(ep) {
+            sample_nearest(src, pos[0], pos[1], ep.edge_mode)
+        } else {
+            sample_bilinear(src, pos[0], pos[1], ep.edge_mode)
+        };
+        inks[plate] =
+            (separate_plate_direct(sampled, plate) * ep.ink_amounts[plate]).clamp(0.0, 2.0);
+        ink_alpha = ink_alpha.max(inks[plate].clamp(0.0, 1.0) * sampled.a);
+    }
+
+    let alpha = if ep.preserve_alpha {
+        original.a
+    } else {
+        original.a.max(ink_alpha)
+    };
+    finish_preview_pixel(inks, original, xy[0], src.w, alpha, ep)
+}
+
+fn finish_preview_pixel(
+    inks: [f32; PLATE_COUNT],
+    original: Rgba,
+    x: f32,
+    width: usize,
+    alpha: f32,
+    ep: &EffectParams,
+) -> Rgba {
+    let mut rgb = preview_rgb(inks, original, x, ep, width);
+    let alpha = if ep.preserve_alpha {
+        alpha.min(original.a)
+    } else {
+        alpha
     };
     rgb = mix_rgb(rgb, unpremultiply(original).rgb, ep.blend_original);
-    let (rgb, out_alpha) = apply_white_transparency(rgb, alpha, ep);
-    let premultiplied = [
-        (rgb[0] * out_alpha).clamp(0.0, 1.0),
-        (rgb[1] * out_alpha).clamp(0.0, 1.0),
-        (rgb[2] * out_alpha).clamp(0.0, 1.0),
-    ];
-    Rgba {
-        rgb: premultiplied,
-        a: out_alpha,
+    composite_preview_to_output(rgb, alpha, ep)
+}
+
+fn use_nearest_sampling(ep: &EffectParams) -> bool {
+    match ep.sampling_mode {
+        SAMPLING_NEAREST => true,
+        _ => false,
     }
 }
 
-fn apply_white_transparency(rgb: [f32; 3], alpha: f32, ep: &EffectParams) -> ([f32; 3], f32) {
+fn composite_preview_to_output(rgb: [f32; 3], alpha: f32, ep: &EffectParams) -> Rgba {
+    let base_alpha = alpha.clamp(0.0, 1.0);
+    let (rgb, base_alpha) = apply_paper_transparency(rgb, base_alpha, ep);
+    Rgba {
+        rgb: [
+            (rgb[0] * base_alpha).clamp(0.0, 1.0),
+            (rgb[1] * base_alpha).clamp(0.0, 1.0),
+            (rgb[2] * base_alpha).clamp(0.0, 1.0),
+        ],
+        a: base_alpha,
+    }
+}
+
+fn apply_paper_transparency(rgb: [f32; 3], alpha: f32, ep: &EffectParams) -> ([f32; 3], f32) {
     let base_alpha = alpha.clamp(0.0, 1.0);
     if !ep.transparent_mode || base_alpha <= 0.0 {
         return (rgb, base_alpha);
@@ -485,23 +656,32 @@ fn apply_white_transparency(rgb: [f32; 3], alpha: f32, ep: &EffectParams) -> ([f
         rgb[1].clamp(0.0, 1.0),
         rgb[2].clamp(0.0, 1.0),
     ];
-    let white_delta = [1.0 - rgb[0], 1.0 - rgb[1], 1.0 - rgb[2]];
-    let matte_alpha = white_delta[0].max(white_delta[1]).max(white_delta[2]);
+    let paper = [
+        ep.paper[0].clamp(0.0, 1.0),
+        ep.paper[1].clamp(0.0, 1.0),
+        ep.paper[2].clamp(0.0, 1.0),
+    ];
+    let matte_alpha = std::array::from_fn::<_, 3, _>(|channel| {
+        let delta = rgb[channel] - paper[channel];
+        if delta < 0.0 {
+            (-delta / paper[channel].max(0.0001)).clamp(0.0, 1.0)
+        } else {
+            (delta / (1.0 - paper[channel]).max(0.0001)).clamp(0.0, 1.0)
+        }
+    })
+    .into_iter()
+    .fold(0.0, f32::max);
+
     if matte_alpha <= 0.0001 {
         return ([0.0, 0.0, 0.0], 0.0);
     }
 
     let recovered_rgb = [
-        (1.0 - white_delta[0] / matte_alpha).clamp(0.0, 1.0),
-        (1.0 - white_delta[1] / matte_alpha).clamp(0.0, 1.0),
-        (1.0 - white_delta[2] / matte_alpha).clamp(0.0, 1.0),
+        ((rgb[0] - paper[0] * (1.0 - matte_alpha)) / matte_alpha).clamp(0.0, 1.0),
+        ((rgb[1] - paper[1] * (1.0 - matte_alpha)) / matte_alpha).clamp(0.0, 1.0),
+        ((rgb[2] - paper[2] * (1.0 - matte_alpha)) / matte_alpha).clamp(0.0, 1.0),
     ];
-    let threshold = 1.0;
-    let normalized_alpha = (matte_alpha / threshold).clamp(0.0, 1.0);
-    let soft_alpha = smoothstep(normalized_alpha);
-    let softness = 0.0;
-    let coverage = normalized_alpha + (soft_alpha - normalized_alpha) * softness;
-    (recovered_rgb, base_alpha * coverage)
+    (recovered_rgb, base_alpha * smoothstep(matte_alpha))
 }
 
 fn preview_rgb(
@@ -545,8 +725,7 @@ fn separate_plate_direct(sampled: Rgba, plate: usize) -> f32 {
         return 0.0;
     }
     let rgb = unpremultiply(sampled).rgb;
-    let ink = rgb_to_cmyk_plate(rgb, plate);
-    (ink * sampled.a).clamp(0.0, 2.0)
+    rgb_to_cmyk_plate(rgb, plate).clamp(0.0, 2.0)
 }
 
 fn separate_all_plates(sampled: Rgba) -> [f32; PLATE_COUNT] {
@@ -556,10 +735,10 @@ fn separate_all_plates(sampled: Rgba) -> [f32; PLATE_COUNT] {
     let rgb = unpremultiply(sampled).rgb;
     let cmyk = rgb_to_cmyk(rgb);
     [
-        (cmyk[0] * sampled.a).clamp(0.0, 2.0),
-        (cmyk[1] * sampled.a).clamp(0.0, 2.0),
-        (cmyk[2] * sampled.a).clamp(0.0, 2.0),
-        (cmyk[3] * sampled.a).clamp(0.0, 2.0),
+        cmyk[0].clamp(0.0, 2.0),
+        cmyk[1].clamp(0.0, 2.0),
+        cmyk[2].clamp(0.0, 2.0),
+        cmyk[3].clamp(0.0, 2.0),
     ]
 }
 
@@ -691,6 +870,9 @@ pub(crate) struct RenderPlan {
 #[derive(Clone, Copy)]
 enum RenderPath {
     CompositeSingleSample,
+    GeneralSingleSample,
+    HalftoneCompositeNoPost,
+    GeneralNoHalftone,
     General,
 }
 
@@ -699,7 +881,7 @@ impl RenderPlan {
         let pivot = [width as f32 * 0.5, height as f32 * 0.5];
         let base_cell = halftone_cell_size(ep);
         let cell = if ep.quality == QUALITY_DRAFT {
-            base_cell.max(2.0) * 1.25
+            base_cell.max(2.0) * 2.0
         } else {
             base_cell.max(1.0)
         };
@@ -725,6 +907,12 @@ impl RenderPlan {
 fn render_path(ep: &EffectParams) -> RenderPath {
     if can_use_composite_single_sample_path(ep) {
         RenderPath::CompositeSingleSample
+    } else if can_use_general_single_sample_path(ep) {
+        RenderPath::GeneralSingleSample
+    } else if can_use_halftone_composite_no_post_path(ep) {
+        RenderPath::HalftoneCompositeNoPost
+    } else if !ep.halftone_enabled {
+        RenderPath::GeneralNoHalftone
     } else {
         RenderPath::General
     }
@@ -747,6 +935,25 @@ pub(crate) fn can_use_composite_single_sample_path(ep: &EffectParams) -> bool {
         && !ep.transparent_mode
 }
 
+fn can_use_general_single_sample_path(ep: &EffectParams) -> bool {
+    let no_plate_offsets = ep
+        .offsets
+        .iter()
+        .all(|offset| offset[0].abs() <= f32::EPSILON && offset[1].abs() <= f32::EPSILON);
+    let no_halftone_offset =
+        ep.halftone_offset[0].abs() <= f32::EPSILON && ep.halftone_offset[1].abs() <= f32::EPSILON;
+    let no_random = !ep.random_enabled || ep.random_amount == [0.0, 0.0];
+    !ep.halftone_enabled && no_plate_offsets && no_halftone_offset && no_random && ep.preserve_alpha
+}
+
+fn can_use_halftone_composite_no_post_path(ep: &EffectParams) -> bool {
+    ep.halftone_enabled
+        && ep.view_mode == VIEW_COMPOSITE
+        && ep.blend_original <= f32::EPSILON
+        && ep.preserve_alpha
+        && !ep.transparent_mode
+}
+
 fn halftone_cell_size(ep: &EffectParams) -> f32 {
     if ep.halftone_unit == HALFTONE_UNIT_LPI {
         (72.0 / ep.halftone_frequency.max(1.0)).clamp(1.0, 1000.0)
@@ -761,8 +968,7 @@ fn final_plate_offset(ep: &EffectParams, plate: usize) -> [f32; 2] {
         offset[0] += random_signed(ep.random_seed, plate as u32 + 1, 0) * ep.random_amount[0];
         offset[1] += random_signed(ep.random_seed, plate as u32 + 1, 1) * ep.random_amount[1];
     }
-    offset[0] = -offset[0];
-    offset
+    [-offset[0], -offset[1]]
 }
 
 pub fn hash_u32(mut value: u32) -> u32 {
@@ -877,11 +1083,11 @@ fn dot_radius(value: f32) -> f32 {
 
 fn dot_edge_width(cell: f32, softness: f32) -> f32 {
     let cell_aa = 0.5 / cell.max(1.0);
-    (cell_aa + softness.clamp(0.0, 1.0) * 0.03).max(0.0001)
+    (cell_aa + softness.clamp(0.0, 1.0) * 0.12).max(0.0001)
 }
 
 fn smooth_circle(dist: f32, radius: f32, edge: f32) -> f32 {
-    ((radius + edge - dist) / (2.0 * edge)).clamp(0.0, 1.0)
+    smoothstep((radius + edge - dist) / (2.0 * edge))
 }
 
 fn smoothstep(t: f32) -> f32 {
@@ -931,12 +1137,8 @@ fn sample_bilinear(src: &Frame, x: f32, y: f32, edge_mode: i32) -> Rgba {
     if w == 0 || h == 0 {
         return Rgba::transparent();
     }
-    let (x, y) = if edge_mode == EDGE_CLAMP {
-        (x.clamp(0.0, (w - 1) as f32), y.clamp(0.0, (h - 1) as f32))
-    } else if x < 0.0 || y < 0.0 || x > (w - 1) as f32 || y > (h - 1) as f32 {
+    let Some((x, y)) = edge_sample_position(x, y, w, h, edge_mode) else {
         return Rgba::transparent();
-    } else {
-        (x, y)
     };
 
     let x0 = x.floor() as usize;
@@ -961,14 +1163,42 @@ fn sample_nearest(src: &Frame, x: f32, y: f32, edge_mode: i32) -> Rgba {
     if w == 0 || h == 0 {
         return Rgba::transparent();
     }
-    let (x, y) = if edge_mode == EDGE_CLAMP {
-        (x.clamp(0.0, (w - 1) as f32), y.clamp(0.0, (h - 1) as f32))
-    } else if x < 0.0 || y < 0.0 || x > (w - 1) as f32 || y > (h - 1) as f32 {
+    let Some((x, y)) = edge_sample_position(x, y, w, h, edge_mode) else {
         return Rgba::transparent();
-    } else {
-        (x, y)
     };
     sample_pixel(src, x.round() as usize, y.round() as usize)
+}
+
+fn edge_sample_position(
+    x: f32,
+    y: f32,
+    width: usize,
+    height: usize,
+    edge_mode: i32,
+) -> Option<(f32, f32)> {
+    match edge_mode {
+        EDGE_CLAMP => Some((
+            x.clamp(0.0, (width - 1) as f32),
+            y.clamp(0.0, (height - 1) as f32),
+        )),
+        EDGE_MIRROR => Some((mirror_coordinate(x, width), mirror_coordinate(y, height))),
+        _ if x < 0.0 || y < 0.0 || x > (width - 1) as f32 || y > (height - 1) as f32 => None,
+        _ => Some((x, y)),
+    }
+}
+
+fn mirror_coordinate(value: f32, len: usize) -> f32 {
+    if len <= 1 {
+        return 0.0;
+    }
+    let max = (len - 1) as f32;
+    let period = max * 2.0;
+    let wrapped = value.rem_euclid(period);
+    if wrapped > max {
+        period - wrapped
+    } else {
+        wrapped
+    }
 }
 
 fn mix_rgba(a: Rgba, b: Rgba, t: f32) -> Rgba {
@@ -1018,11 +1248,12 @@ mod tests {
             halftone_unit: HALFTONE_UNIT_PIXELS,
             halftone_shape: DOT_CIRCLE,
             halftone_dot_gain: 0.0,
-            halftone_softness: 0.1,
+            halftone_softness: 0.0,
             halftone_angles: [15.0, 75.0, 0.0, 45.0],
             halftone_offset: [0.0, 0.0],
             backend: BACKEND_AUTO,
             quality: QUALITY_FULL,
+            sampling_mode: SAMPLING_BILINEAR,
             edge_mode: EDGE_TRANSPARENT,
             expand_bounds: false,
             conversion_mode: CONVERSION_SIMPLE,
@@ -1082,12 +1313,22 @@ mod tests {
     }
 
     #[test]
+    fn plate_separation_does_not_bake_in_alpha() {
+        let semi_black = Rgba {
+            rgb: [0.0, 0.0, 0.0],
+            a: 0.5,
+        };
+
+        assert_eq!(separate_all_plates(semi_black), [0.0, 0.0, 0.0, 1.0]);
+        assert!((separate_plate_direct(semi_black, 3) - 1.0).abs() < 0.0001);
+    }
+
+    #[test]
     fn composite_single_sample_fast_path_matches_general_pixel() {
         let mut ep = test_params();
         ep.halftone_enabled = false;
         ep.view_mode = VIEW_COMPOSITE;
         ep.blend_original = 0.0;
-        ep.transparent_mode = false;
         ep.offsets = [[0.0, 0.0]; PLATE_COUNT];
         ep.random_enabled = false;
         ep.conversion_mode = CONVERSION_SIMPLE;
@@ -1113,6 +1354,91 @@ mod tests {
     }
 
     #[test]
+    fn general_single_sample_fast_path_matches_general_pixel() {
+        let mut ep = test_params();
+        ep.halftone_enabled = false;
+        ep.view_mode = VIEW_CYAN;
+        ep.blend_original = 0.25;
+        ep.offsets = [[0.0, 0.0]; PLATE_COUNT];
+        ep.random_enabled = false;
+        assert!(can_use_general_single_sample_path(&ep));
+
+        let src = Frame {
+            w: 2,
+            h: 1,
+            pixels: vec![
+                Rgba {
+                    rgb: [0.32, 0.18, 0.08],
+                    a: 0.8,
+                },
+                Rgba {
+                    rgb: [0.1, 0.7, 0.2],
+                    a: 1.0,
+                },
+            ],
+        };
+        let plan = RenderPlan::new(&ep, src.w, src.h);
+        for x in 0..src.w {
+            let original = src.pixels[x];
+            let fast = render_single_sample_general(original, x as f32, &ep, src.w);
+            let general = render_pixel(&src, [x as f32, 0.0], original, &ep, &plan);
+            assert!((fast.a - general.a).abs() < 0.0001);
+            for channel in 0..3 {
+                assert!((fast.rgb[channel] - general.rgb[channel]).abs() < 0.0001);
+            }
+        }
+    }
+
+    #[test]
+    fn no_halftone_path_matches_general_pixel_with_offsets() {
+        let mut ep = test_params();
+        ep.halftone_enabled = false;
+        ep.view_mode = VIEW_MAGENTA;
+        ep.offsets = [[0.0, 0.0], [0.35, -0.2], [0.0, 0.0], [0.0, 0.0]];
+        ep.random_enabled = false;
+        assert!(matches!(
+            render_path(&ep),
+            RenderPath::GeneralNoHalftone | RenderPath::GeneralSingleSample
+        ));
+
+        let src = Frame {
+            w: 2,
+            h: 2,
+            pixels: vec![
+                Rgba {
+                    rgb: [0.9, 0.1, 0.3],
+                    a: 1.0,
+                },
+                Rgba {
+                    rgb: [0.2, 0.8, 0.1],
+                    a: 0.7,
+                },
+                Rgba {
+                    rgb: [0.4, 0.2, 0.9],
+                    a: 1.0,
+                },
+                Rgba {
+                    rgb: [0.1, 0.1, 0.1],
+                    a: 0.4,
+                },
+            ],
+        };
+        let plan = RenderPlan::new(&ep, src.w, src.h);
+        for y in 0..src.h {
+            for x in 0..src.w {
+                let xy = [x as f32, y as f32];
+                let original = sample_pixel(&src, x, y);
+                let fast = render_pixel_no_halftone(&src, xy, original, &ep, &plan);
+                let general = render_pixel(&src, xy, original, &ep, &plan);
+                assert!((fast.a - general.a).abs() < 0.0001);
+                for channel in 0..3 {
+                    assert!((fast.rgb[channel] - general.rgb[channel]).abs() < 0.0001);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn defaults_match_cmyk_dots_preset() {
         let options = CmykPressOptions::default();
         let ffi = CmykPressParams::default();
@@ -1123,6 +1449,11 @@ mod tests {
         assert_eq!(ffi.halftone_shape, CMYK_DOT_CIRCLE);
         assert_eq!(ffi.view_mode, CMYK_VIEW_COMPOSITE);
         assert_eq!(ffi.quality, CMYK_QUALITY_FULL);
+        assert_eq!(ffi.sampling_mode, CMYK_SAMPLING_BILINEAR);
+        assert_eq!(ffi.edge_mode, CMYK_EDGE_TRANSPARENT);
+        assert_eq!(ffi.transparent_mode, 0);
+        assert_eq!(options.edge_mode as i32, EDGE_TRANSPARENT);
+        assert!(!options.transparent_mode);
         assert_eq!(ffi.random_registration_enabled, 0);
         assert_eq!(ffi.random_plate_mask, 0b0111);
         assert_eq!(options.ink_amounts, DEFAULT_INK_AMOUNTS);
@@ -1132,19 +1463,23 @@ mod tests {
         assert_eq!(ffi.yellow_amount, DEFAULT_CMY_INK_AMOUNT);
         assert_eq!(ffi.black_amount, DEFAULT_BLACK_INK_AMOUNT);
         assert_eq!(ffi.halftone_dot_gain, DEFAULT_HALFTONE_DOT_GAIN);
+        assert_eq!(options.halftone_softness, 0.0);
+        assert_eq!(ffi.halftone_softness, 0.0);
     }
 
     #[test]
-    fn default_preset_is_lighter_than_full_ink_pressing() {
+    fn default_preset_matches_zero_dot_gain_pressing() {
         let input = vec![[0.18, 0.16, 0.14, 1.0]; 64 * 64];
-        let lighter = render_rgba_f32(&input, 64, 64, &CmykPressOptions::default());
+        let default = render_rgba_f32(&input, 64, 64, &CmykPressOptions::default());
 
-        let mut heavy = CmykPressOptions::default();
-        heavy.ink_amounts = [1.0; PLATE_COUNT];
-        heavy.halftone_dot_gain = 0.0;
-        let heavy = render_rgba_f32(&input, 64, 64, &heavy);
+        let explicit = CmykPressOptions {
+            ink_amounts: [1.0; PLATE_COUNT],
+            halftone_dot_gain: 0.0,
+            ..CmykPressOptions::default()
+        };
+        let explicit = render_rgba_f32(&input, 64, 64, &explicit);
 
-        assert!(average_luma(&lighter) > average_luma(&heavy) + 0.02);
+        assert!((average_luma(&default) - average_luma(&explicit)).abs() < 0.0001);
     }
 
     #[test]
@@ -1153,14 +1488,18 @@ mod tests {
         params.view_mode = CMYK_VIEW_CYAN;
         params.halftone_shape = CMYK_DOT_SQUARE;
         params.quality = CMYK_QUALITY_DRAFT;
-        params.edge_mode = CMYK_EDGE_CLAMP;
+        params.sampling_mode = CMYK_SAMPLING_NEAREST;
+        params.edge_mode = CMYK_EDGE_MIRROR;
+        params.transparent_mode = 1;
         params.random_plate_mask = 0b1010;
 
         let options = CmykPressOptions::from(params);
         assert_eq!(options.view_mode as i32, VIEW_CYAN);
         assert_eq!(options.halftone_shape as i32, DOT_SQUARE);
         assert_eq!(options.quality as i32, QUALITY_DRAFT);
-        assert_eq!(options.edge_mode as i32, EDGE_CLAMP);
+        assert_eq!(options.sampling_mode as i32, SAMPLING_NEAREST);
+        assert_eq!(options.edge_mode as i32, EDGE_MIRROR);
+        assert!(options.transparent_mode);
         assert_eq!(options.random_affect, [false, true, false, true]);
     }
 
@@ -1184,6 +1523,81 @@ mod tests {
         };
         let ep = options.to_effect_params();
         assert_eq!(ep.ink_amounts, [1.0; PLATE_COUNT]);
+    }
+
+    #[test]
+    fn sampling_mode_is_explicit() {
+        let mut ep = test_params();
+        ep.quality = QUALITY_DRAFT;
+        ep.sampling_mode = SAMPLING_BILINEAR;
+        assert!(!use_nearest_sampling(&ep));
+
+        ep.quality = QUALITY_FULL;
+        ep.sampling_mode = SAMPLING_NEAREST;
+        assert!(use_nearest_sampling(&ep));
+
+        ep.sampling_mode = 999;
+        assert!(!use_nearest_sampling(&ep));
+    }
+
+    #[test]
+    fn sampling_modes_differ_at_fractional_positions() {
+        let src = Frame {
+            w: 2,
+            h: 1,
+            pixels: vec![
+                Rgba {
+                    rgb: [0.0, 0.0, 0.0],
+                    a: 1.0,
+                },
+                Rgba {
+                    rgb: [1.0, 1.0, 1.0],
+                    a: 1.0,
+                },
+            ],
+        };
+
+        let bilinear = sample_bilinear(&src, 0.5, 0.0, EDGE_CLAMP);
+        let nearest = sample_nearest(&src, 0.5, 0.0, EDGE_CLAMP);
+
+        assert_ne!(bilinear.rgb, nearest.rgb);
+        assert_eq!(bilinear.rgb, [0.5, 0.5, 0.5]);
+    }
+
+    #[test]
+    fn bilinear_sampling_preserves_color_at_transparent_edges() {
+        let src = Frame {
+            w: 2,
+            h: 1,
+            pixels: vec![
+                Rgba {
+                    rgb: [1.0, 0.0, 0.0],
+                    a: 1.0,
+                },
+                Rgba::transparent(),
+            ],
+        };
+
+        let sampled = sample_bilinear(&src, 0.5, 0.0, EDGE_TRANSPARENT);
+        let straight = unpremultiply(sampled);
+
+        assert!((sampled.a - 0.5).abs() < 0.0001);
+        assert!((straight.rgb[0] - 1.0).abs() < 0.0001);
+        assert!(straight.rgb[1] < 0.0001);
+        assert!(straight.rgb[2] < 0.0001);
+    }
+
+    #[test]
+    fn halftone_offset_accepts_unbounded_public_values() {
+        let mut options = CmykPressOptions::default();
+        options.halftone_offset = [10_000.0, -10_000.0];
+        let ep = options.to_effect_params();
+        assert_eq!(ep.halftone_offset, [10_000.0, -10_000.0]);
+
+        let mut params = CmykPressParams::default();
+        params.halftone_offset = [-10_000.0, 10_000.0];
+        let options = CmykPressOptions::from(params);
+        assert_eq!(options.halftone_offset, [-10_000.0, 10_000.0]);
     }
 
     #[test]
@@ -1217,7 +1631,7 @@ mod tests {
         let mut ep = test_params();
         ep.offsets[0] = [12.0, -3.0];
         let plan = RenderPlan::new(&ep, 100, 100);
-        assert_eq!(plan.plates[0].shift, [-12.0, -3.0]);
+        assert_eq!(plan.plates[0].shift, [-12.0, 3.0]);
     }
 
     #[test]
@@ -1260,6 +1674,50 @@ mod tests {
         ep.halftone_dot_gain = 1.0;
         let thick = halftone_coverage([12.0, 18.0], 0.5, &plan.plates[0], &ep);
         assert!(thick >= thin);
+    }
+
+    #[test]
+    fn quality_changes_halftone_cell_size() {
+        let mut ep = test_params();
+        ep.quality = QUALITY_FULL;
+        let full = RenderPlan::new(&ep, 100, 100);
+
+        ep.quality = QUALITY_DRAFT;
+        let draft = RenderPlan::new(&ep, 100, 100);
+
+        assert!(draft.plates[0].cell >= full.plates[0].cell * 1.9);
+    }
+
+    #[test]
+    fn halftone_angle_changes_line_orientation() {
+        let mut ep = test_params();
+        ep.halftone_shape = DOT_LINE;
+        ep.halftone_angles = [0.0; PLATE_COUNT];
+        let plan_0 = RenderPlan::new(&ep, 100, 100);
+        let coverage_0 = halftone_coverage([53.0, 50.0], 0.5, &plan_0.plates[0], &ep);
+
+        ep.halftone_angles = [90.0; PLATE_COUNT];
+        let plan_90 = RenderPlan::new(&ep, 100, 100);
+        let coverage_90 = halftone_coverage([53.0, 50.0], 0.5, &plan_90.plates[0], &ep);
+
+        assert!((coverage_0 - coverage_90).abs() > 0.01);
+    }
+
+    #[test]
+    fn halftone_angle_changes_rendered_pixels() {
+        let input = vec![[0.0, 0.0, 0.0, 1.0]; 32 * 32];
+        let mut options = CmykPressOptions {
+            halftone_shape: DOT_LINE as u32,
+            halftone_frequency: 8.0,
+            halftone_angles: [0.0; PLATE_COUNT],
+            ..CmykPressOptions::default()
+        };
+        let angle_0 = render_rgba_f32(&input, 32, 32, &options);
+
+        options.halftone_angles = [90.0; PLATE_COUNT];
+        let angle_90 = render_rgba_f32(&input, 32, 32, &options);
+
+        assert_ne!(angle_0, angle_90);
     }
 
     #[test]
@@ -1328,6 +1786,55 @@ mod tests {
     }
 
     #[test]
+    fn mirror_edge_mode_reflects_out_of_bounds_sampling() {
+        let src = Frame {
+            w: 3,
+            h: 1,
+            pixels: vec![
+                Rgba {
+                    rgb: [0.0, 0.0, 0.0],
+                    a: 1.0,
+                },
+                Rgba {
+                    rgb: [0.5, 0.5, 0.5],
+                    a: 1.0,
+                },
+                Rgba {
+                    rgb: [1.0, 1.0, 1.0],
+                    a: 1.0,
+                },
+            ],
+        };
+
+        assert_eq!(sample_nearest(&src, -1.0, 0.0, EDGE_MIRROR).rgb, [0.5; 3]);
+        assert_eq!(sample_nearest(&src, 3.0, 0.0, EDGE_MIRROR).rgb, [0.5; 3]);
+    }
+
+    #[test]
+    fn repeat_edge_pixels_affects_offset_rendering() {
+        let input = vec![[0.0, 0.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]];
+        let base_options = CmykPressOptions {
+            halftone_enabled: false,
+            transparent_mode: false,
+            offsets: [[1.0, 0.0]; PLATE_COUNT],
+            ..CmykPressOptions::default()
+        };
+
+        let transparent = render_rgba_f32(&input, 2, 1, &base_options);
+        let repeated = render_rgba_f32(
+            &input,
+            2,
+            1,
+            &CmykPressOptions {
+                edge_mode: EDGE_CLAMP as u32,
+                ..base_options
+            },
+        );
+
+        assert!(average_luma(&repeated) < average_luma(&transparent) - 0.2);
+    }
+
+    #[test]
     fn transparent_pixels_do_not_create_black_edges() {
         let cmyk_options = CmykPressOptions::default();
         let ep = cmyk_options.to_effect_params();
@@ -1342,21 +1849,72 @@ mod tests {
     }
 
     #[test]
-    fn white_transparency_behaves_like_white_unmult() {
+    fn keep_alpha_off_does_not_make_paper_from_unprinted_offset_sample() {
+        let mut ep = test_params();
+        ep.preserve_alpha = false;
+        ep.halftone_enabled = false;
+        ep.offsets = [[1.0, 0.0]; PLATE_COUNT];
+
+        let src = Frame {
+            w: 2,
+            h: 1,
+            pixels: vec![
+                Rgba {
+                    rgb: [1.0, 1.0, 1.0],
+                    a: 1.0,
+                },
+                Rgba::transparent(),
+            ],
+        };
+        let plan = RenderPlan::new(&ep, src.w, src.h);
+        let out = render_pixel_no_halftone(&src, [1.0, 0.0], src.pixels[1], &ep, &plan);
+
+        assert_eq!(out.a, 0.0);
+        assert_eq!(out.rgb, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn transparent_background_keys_paper_but_keeps_ink() {
         let mut ep = test_params();
         ep.halftone_enabled = false;
         ep.transparent_mode = true;
 
-        let (_white_rgb, white_alpha) = apply_white_transparency([1.0, 1.0, 1.0], 1.0, &ep);
-        let (red_rgb, red_alpha) = apply_white_transparency([1.0, 0.5, 0.5], 1.0, &ep);
-        let (gray_rgb, gray_alpha) = apply_white_transparency([0.7, 0.7, 0.7], 1.0, &ep);
+        let paper = composite_preview_to_output([1.0, 1.0, 1.0], 1.0, &ep);
+        let red_ink = composite_preview_to_output([1.0, 0.5, 0.5], 1.0, &ep);
+        let gray_ink = composite_preview_to_output([0.7, 0.7, 0.7], 1.0, &ep);
 
-        assert!(white_alpha < 0.001);
-        assert!((red_alpha - 0.5).abs() < 0.001);
-        assert!((red_rgb[0] - 1.0).abs() < 0.001);
-        assert!(red_rgb[1] < 0.001 && red_rgb[2] < 0.001);
-        assert!((gray_alpha - 0.3).abs() < 0.001);
-        assert!(gray_rgb.iter().all(|channel| *channel < 0.001));
+        assert!(paper.a < 0.001);
+        assert!((red_ink.a - 0.5).abs() < 0.001);
+        assert!((unpremultiply(red_ink).rgb[0] - 1.0).abs() < 0.001);
+        assert!(unpremultiply(red_ink).rgb[1] < 0.001);
+        assert!(unpremultiply(red_ink).rgb[2] < 0.001);
+        assert!((gray_ink.a - 0.216).abs() < 0.001);
+        assert!(unpremultiply(gray_ink)
+            .rgb
+            .iter()
+            .all(|channel| *channel < 0.001));
+    }
+
+    #[test]
+    fn default_render_has_paper_background_but_can_disable_it() {
+        let input = vec![[1.0, 1.0, 1.0, 1.0]];
+
+        let default_out = render_rgba_f32(&input, 1, 1, &CmykPressOptions::default());
+        assert!(default_out[0][3] > 0.999);
+        assert!(default_out[0][0] > 0.999);
+        assert!(default_out[0][1] > 0.999);
+        assert!(default_out[0][2] > 0.999);
+
+        let without_paper = render_rgba_f32(
+            &input,
+            1,
+            1,
+            &CmykPressOptions {
+                transparent_mode: true,
+                ..CmykPressOptions::default()
+            },
+        );
+        assert!(without_paper[0][3] < 0.001);
     }
 
     #[test]
@@ -1370,10 +1928,19 @@ mod tests {
 
     #[test]
     fn public_param_render_entrypoint_uses_default_dots() {
-        let input = vec![[0.0, 0.0, 0.0, 1.0]; 8 * 8];
-        let out = render_rgba_f32_with_params(&input, 8, 8, &CmykPressParams::default());
-        assert_eq!(out.len(), 64);
+        let input = vec![[0.0, 0.0, 0.0, 1.0]; 64 * 64];
+        let out = render_rgba_f32_with_params(&input, 64, 64, &CmykPressParams::default());
+        assert_eq!(out.len(), 64 * 64);
         assert!(out.iter().all(|px| px[3] == 1.0));
+
+        let mut params = CmykPressParams::default();
+        params.transparent_mode = 1;
+        let without_paper = render_rgba_f32_with_params(&input, 64, 64, &params);
+        assert!(without_paper.iter().all(|px| (0.0..=1.0).contains(&px[3])));
+        let min_alpha = without_paper.iter().map(|px| px[3]).fold(1.0, f32::min);
+        let max_alpha = without_paper.iter().map(|px| px[3]).fold(0.0, f32::max);
+        assert!(max_alpha > 0.0);
+        assert!(min_alpha < max_alpha);
     }
 
     #[test]
