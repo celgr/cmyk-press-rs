@@ -1,20 +1,6 @@
 # CMYK Press
 
-CMYK Press は、CMYK 印刷風の色分解、固定された版ズレ、円形の網点、紙色、および元画像とのブレンドを実現する Rust 製の After Effects ネイティブエフェクトです。
-
-- モード: `Default CMYK Dots`
-- 合成方法: `Composite`
-- 網点処理: 有効
-- 網点形状: 円形
-- 固定ランダム版ズレ: 無効
-- 品質: フル品質
-
-## エフェクト情報
-
-- 表示名: `CMYK Press`
-- Match Name: `CMYK Press`
-- カテゴリ: `Stylize`
-- macOS 版の出力先: `rust/target/release/CMYK Press.plugin`
+CMYK Pressは、印刷っぽい表現ができるRust製のAfterEffectsプラグインです。
 
 ## ビルド
 
