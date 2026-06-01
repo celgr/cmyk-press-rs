@@ -4,47 +4,48 @@ CMYK Pressは、印刷っぽい表現ができるRust製のAfterEffectsプラグ
 
 ## ビルド
 
-### macOS で必要なもの
+### macOS
+
+必要な環境は以下のとおりです。
 
 - Xcode Command Line Tools（`clang`、`codesign`、`PlistBuddy` を使用します）
 - Rust stable toolchain（`cargo` を使用します）
 - GitHub の git 依存関係を取得できるネットワーク環境
 
-macOS では、以下のコマンドを実行します。
+以下のコマンドを実行します。
 
 ```bash
 bash ./scripts/build_macos_release.sh
 ```
 
-ビルドされたプラグインは、以下の場所に出力されます。
+ビルドされたプラグインは以下に出力されます。
 
 ```text
 rust/target/release/CMYK Press.plugin
 ```
 
-Windows では、以下の環境が必要です。
+### Windows
+
+必要な環境は以下のとおりです。
 
 - Windows 10 / 11 x64
-- Rust MSVC toolchain
-  - `cargo` と `rustc` が使えること
-- Visual Studio 2022 Build Tools
-  - `Microsoft.VisualStudio.Workload.VCTools` を含めること
-  - MSVC リンカ `link.exe` が使えること
+- Rust MSVC toolchain（`cargo` と `rustc` を使用します）
+- Visual Studio 2022 Build Tools（`Microsoft.VisualStudio.Workload.VCTools` と `link.exe` を使用します）
 
-`winget` が使える環境では、以下のようにインストールできます。
+`winget` が使える場合は、以下のコマンドでインストールできます。
 
 ```powershell
 winget install --id Rustlang.Rust.MSVC --exact
 winget install --id Microsoft.VisualStudio.2022.BuildTools --exact --override "--wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
 ```
 
-インストール後、新しい PowerShell または「x64 Native Tools Command Prompt for VS 2022」を開いて、以下を実行します。
+インストール後、新しい PowerShell または「x64 Native Tools Command Prompt for VS 2022」を開き、以下のコマンドを実行します。
 
 ```powershell
 .\scripts\build_windows_release.ps1
 ```
 
-PowerShell の実行ポリシーでスクリプトが止まる場合は、以下のように実行します。
+PowerShell の実行ポリシーで止まる場合は、以下のコマンドで実行します。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_release.ps1
@@ -52,7 +53,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\build_windows_release.ps1
 
 `link.exe` が見つからない場合は、Visual Studio の C++ Build Tools が入っていないか、MSVC の開発者環境が読み込まれていません。「x64 Native Tools Command Prompt for VS 2022」から再実行してください。
 
-ビルドされた `.aex` は、以下の場所に出力されます。
+ビルドされたプラグインは以下に出力されます。
 
 ```text
 rust/target/release/CMYK Press.aex
