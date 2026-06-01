@@ -4,6 +4,12 @@ CMYK Pressは、印刷っぽい表現ができるRust製のAfterEffectsプラグ
 
 ## ビルド
 
+### macOS で必要なもの
+
+- Xcode Command Line Tools（`clang`、`codesign`、`PlistBuddy` を使用します）
+- Rust stable toolchain（`cargo` を使用します）
+- GitHub の git 依存関係を取得できるネットワーク環境
+
 macOS では、以下のコマンドを実行します。
 
 ```bash
