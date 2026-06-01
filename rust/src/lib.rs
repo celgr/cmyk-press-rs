@@ -1341,7 +1341,7 @@ mod metal_gpu {
         _pad: f32,
     }
 
-    #[repr(C)]
+    #[repr(C, align(16))]
     #[derive(Clone, Copy)]
     pub(super) struct MetalParams {
         width: u32,
@@ -1358,6 +1358,7 @@ mod metal_gpu {
         sampling_mode: i32,
         edge_mode: i32,
         conversion_mode: i32,
+        _pad0: [i32; 2],
         paper: [f32; 4],
         ink_amounts: [f32; 4],
         halftone_offset: [f32; 4],
@@ -1384,6 +1385,7 @@ mod metal_gpu {
                 sampling_mode: ep.sampling_mode,
                 edge_mode: ep.edge_mode,
                 conversion_mode: ep.conversion_mode,
+                _pad0: [0; 2],
                 paper: [ep.paper[0], ep.paper[1], ep.paper[2], 1.0],
                 ink_amounts: ep.ink_amounts,
                 halftone_offset: [ep.halftone_offset[0], ep.halftone_offset[1], 0.0, 0.0],
@@ -1410,6 +1412,16 @@ mod metal_gpu {
                 }),
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn metal_params_layout_offsets() -> (usize, usize, usize, usize) {
+        (
+            std::mem::offset_of!(MetalParams, paper),
+            std::mem::offset_of!(MetalParams, ink_amounts),
+            std::mem::offset_of!(MetalParams, halftone_offset),
+            std::mem::offset_of!(MetalParams, plates),
+        )
     }
 
     pub struct MetalState {
@@ -1626,6 +1638,7 @@ struct Params {
     int sampling_mode;
     int edge_mode;
     int conversion_mode;
+    int2 pad0;
     float4 paper;
     float4 ink_amounts;
     float4 halftone_offset;

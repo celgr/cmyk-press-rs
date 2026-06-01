@@ -2052,6 +2052,19 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn metal_params_layout_matches_shader_float4_alignment() {
+        let (paper, ink_amounts, halftone_offset, plates) =
+            metal_gpu::metal_params_layout_offsets();
+
+        assert_eq!(paper, 64);
+        assert_eq!(ink_amounts, 80);
+        assert_eq!(halftone_offset, 96);
+        assert_eq!(plates, 176);
+        assert_eq!(std::mem::align_of::<metal_gpu::MetalParams>(), 16);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn metal_shader_dispatches_when_device_available() {
         let Some(device) = metal::Device::system_default() else {
             return;
