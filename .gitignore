@@ -5,6 +5,9 @@ target/
 # Local task notes
 /tasks.md
 
+# Local documentation drafts
+/docs/
+
 # After Effects plugin artifacts
 *.plugin/
 *.aex
